@@ -8,9 +8,9 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import LabelEncoder
 
 # ======================================================
-# 1. CONFIGURACIÓN
+# 1. CONFIGURACIÓN Y ESTILOS
 # ======================================================
-st.set_page_config(page_title="Sniper AI Betting", layout="wide", page_icon="🎯")
+st.set_page_config(page_title="AI Betting Suite", layout="wide", page_icon="🚀")
 CSV_FILE = 'mis_apuestas_ml.csv'
 
 st.markdown("""
@@ -22,7 +22,6 @@ st.markdown("""
         border-radius: 10px;
     }
     h1, h2, h3 { text-align: center; }
-    .big-font { font-size:20px !important; font-weight: bold; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -41,28 +40,37 @@ def fetch_live_soccer_data(league_code="SP1"):
                    'B365H': 'odd_h', 'B365D': 'odd_d', 'B365A': 'odd_a', 'HST': 'home_shots', 'AST': 'away_shots'}
         df = df.rename(columns=mapping).dropna().sort_values('date')
         df['date'] = pd.to_datetime(df['date'], dayfirst=True, errors='coerce')
+        
+        # Target: 1=Home, 2=Away, 0=Draw
         conditions = [(df['home_goals'] > df['away_goals']), (df['home_goals'] < df['away_goals'])]
         df['result'] = np.select(conditions, [1, 2], default=0)
         return df
     except: return pd.DataFrame()
 
 def calculate_rolling_features(df):
+    """Crea estadísticas de forma reciente (últimos 3 partidos)"""
     h_df = df[['date', 'home', 'home_goals', 'away_goals', 'result']].rename(columns={'home':'team', 'home_goals':'gf', 'away_goals':'ga', 'result':'res'})
     h_df['pts'] = np.where(h_df['res']==1, 3, np.where(h_df['res']==0, 1, 0))
     a_df = df[['date', 'away', 'away_goals', 'home_goals', 'result']].rename(columns={'away':'team', 'away_goals':'gf', 'home_goals':'ga', 'result':'res'})
     a_df['pts'] = np.where(a_df['res']==2, 3, np.where(a_df['res']==0, 1, 0))
     
     stats = pd.concat([h_df, a_df]).sort_values(['team', 'date'])
+    
+    # Rolling 3
     for col in ['pts', 'gf', 'ga']:
         stats[f'roll_{col}'] = stats.groupby('team')[col].transform(lambda x: x.rolling(3, min_periods=1).mean().shift(1)).fillna(0)
     
+    # Merge back
     df = df.merge(stats[['date', 'team', 'roll_pts', 'roll_gf', 'roll_ga']], left_on=['date', 'home'], right_on=['date', 'team'], how='left').rename(columns={'roll_pts':'h_form', 'roll_gf':'h_att', 'roll_ga':'h_def'}).drop(columns=['team'])
     df = df.merge(stats[['date', 'team', 'roll_pts', 'roll_gf', 'roll_ga']], left_on=['date', 'away'], right_on=['date', 'team'], how='left').rename(columns={'roll_pts':'a_form', 'roll_gf':'a_att', 'roll_ga':'a_def'}).drop(columns=['team'])
-    return df.fillna(0)
+    
+    df = df.fillna(0)
+    return df
 
 def manage_bets(mode, data=None, id_bet=None, status=None):
     if os.path.exists(CSV_FILE): df = pd.read_csv(CSV_FILE)
     else: df = pd.DataFrame(columns=["ID", "Fecha", "Liga", "Partido", "Pick", "Cuota", "Stake", "Prob", "Estado", "Ganancia"])
+    
     if mode == "save":
         df = pd.concat([df, pd.DataFrame([data])], ignore_index=True)
         df.to_csv(CSV_FILE, index=False)
@@ -99,6 +107,7 @@ def plot_gauge(val, title, color):
 # ======================================================
 # 3. MODELOS (AI & DIXON-COLES)
 # ======================================================
+# --- Dixon Coles ---
 def calculate_dc_stats(df):
     last = df['date'].max()
     df['days'] = (last - df['date']).dt.days
@@ -134,6 +143,7 @@ def predict_dc(home, away, stats, avg_h, avg_a):
     probs /= probs.sum()
     return np.tril(probs,-1).sum(), np.diag(probs).sum(), np.triu(probs,1).sum(), he, ae
 
+# --- Random Forest ---
 def train_rf(df_train, df_full_encoding):
     le = LabelEncoder()
     le.fit(pd.concat([df_full_encoding['home'], df_full_encoding['away']]).unique())
@@ -202,7 +212,16 @@ def run_backtest_blind(df_full, model_type, min_conf=0.0):
 # ======================================================
 with st.sidebar:
     st.header("⚙️ Configuración")
-    leagues = {"SP1": "🇪🇸 La Liga", "E0": "🏴󠁧󠁢󠁥󠁮󠁧󠁿 Premier League", "I1": "🇮🇹 Serie A", "D1": "🇩🇪 Bundesliga"}
+    
+    # --- LISTA DE LIGAS (AHORA INCLUYE LIGUE 1) ---
+    leagues = {
+        "SP1": "🇪🇸 La Liga", 
+        "E0": "🏴󠁧󠁢󠁥󠁮󠁧󠁿 Premier League", 
+        "I1": "🇮🇹 Serie A", 
+        "D1": "🇩🇪 Bundesliga",
+        "F1": "🇫🇷 Ligue 1"
+    }
+    
     code = st.selectbox("Liga", list(leagues.keys()), format_func=lambda x: leagues[x])
     
     raw = fetch_live_soccer_data(code)
@@ -212,11 +231,10 @@ with st.sidebar:
     st.divider()
     m_type = st.radio("Cerebro:", ["Dixon-Coles (Estadístico)", "Random Forest (IA)"], index=1)
     
-    # --- FILTRO FRANCOTIRADOR ---
     st.divider()
     st.markdown("### 🎯 Modo Francotirador")
     confidence_threshold = st.slider("Confianza Mínima (%)", 0, 100, 50, step=5) / 100.0
-    st.caption(f"Solo se mostrarán apuestas donde la IA tenga >{confidence_threshold*100:.0f}% de seguridad.")
+    st.caption(f"Filtro: >{confidence_threshold*100:.0f}%")
 
     if "IA" in m_type:
         rf_model_main, encoder_main = train_rf(df_pro, df_pro)
@@ -324,6 +342,7 @@ with tab3:
                 res = st.selectbox("Resultado", ["Ganada", "Perdida", "Push"])
                 if st.button("Actualizar"): manage_bets("update", id_bet=bid, status=res); st.rerun()
             else: st.info("No hay pendientes")
+    else: st.info("Historial vacío")
 
 with tab4:
     st.markdown("### 🧪 Laboratorio de Backtesting (Blind Test)")
