@@ -64,9 +64,8 @@ def calculate_rolling_features(df):
     df = df.merge(stats[['date', 'team', 'roll_pts', 'roll_gf', 'roll_ga']], left_on=['date', 'home'], right_on=['date', 'team'], how='left').rename(columns={'roll_pts':'h_form', 'roll_gf':'h_att', 'roll_ga':'h_def'}).drop(columns=['team'])
     df = df.merge(stats[['date', 'team', 'roll_pts', 'roll_gf', 'roll_ga']], left_on=['date', 'away'], right_on=['date', 'team'], how='left').rename(columns={'roll_pts':'a_form', 'roll_gf':'a_att', 'roll_ga':'a_def'}).drop(columns=['team'])
     
-    # Rellenar nulos por si acaso
     df = df.fillna(0)
-    return df, stats
+    return df
 
 def manage_bets(mode, data=None, id_bet=None, status=None):
     if os.path.exists(CSV_FILE): df = pd.read_csv(CSV_FILE)
@@ -145,34 +144,32 @@ def predict_dc(home, away, stats, avg_h, avg_a):
     return np.tril(probs,-1).sum(), np.diag(probs).sum(), np.triu(probs,1).sum(), he, ae
 
 # --- Random Forest ---
-def train_rf(df):
+def train_rf(df_train, df_full_for_encoding):
+    """
+    Entrena la IA.
+    NOTA: Recibe df_full_for_encoding solo para que el LabelEncoder
+    conozca todos los equipos posibles y no falle si en el futuro aparece uno nuevo.
+    """
     le = LabelEncoder()
-    # Entrenamos encoder con todos los equipos posibles
-    le.fit(pd.concat([df['home'], df['away']]).unique())
+    # Entrenar encoder con TODOS los equipos de la liga (pasado y futuro)
+    all_teams = pd.concat([df_full_for_encoding['home'], df_full_for_encoding['away']]).unique()
+    le.fit(all_teams)
     
-    # Creamos columnas codificadas EN EL DATAFRAME para que el Backtest las vea
-    df['hc'] = le.transform(df['home'])
-    df['ac'] = le.transform(df['away'])
+    # Pero entrenar el modelo SOLO con df_train
+    df_train = df_train.copy()
+    df_train['hc'] = le.transform(df_train['home'])
+    df_train['ac'] = le.transform(df_train['away'])
     
     feats = ['hc', 'ac', 'odd_h', 'odd_d', 'odd_a', 'h_form', 'h_att', 'h_def', 'a_form', 'a_att', 'a_def']
     
-    # Entrenar modelo
     model = RandomForestClassifier(n_estimators=100, max_depth=10, random_state=42)
-    model.fit(df[feats], df['result'])
+    model.fit(df_train[feats], df_train['result'])
     
-    return model, le, df # Devolvemos el df modificado con 'hc' y 'ac'
+    return model, le
 
-def predict_rf(model, le, home, away, oh, od, oa, stats_df):
+def predict_rf(model, le, home, away, oh, od, oa, hf, ha, hd, af, aa, ad):
     try:
         hc, ac = le.transform([home])[0], le.transform([away])[0]
-        # Get recent stats
-        h_st = stats_df[stats_df['team']==home].tail(1)
-        a_st = stats_df[stats_df['team']==away].tail(1)
-        
-        # Safe fetch stats
-        hf, ha, hd = (h_st.iloc[0]['roll_pts']*3, h_st.iloc[0]['roll_gf'], h_st.iloc[0]['roll_ga']) if not h_st.empty else (0,0,0)
-        af, aa, ad = (a_st.iloc[0]['roll_pts']*3, a_st.iloc[0]['roll_gf'], a_st.iloc[0]['roll_ga']) if not a_st.empty else (0,0,0)
-
         in_data = pd.DataFrame([[hc, ac, oh, od, oa, hf, ha, hd, af, aa, ad]], 
                                columns=['hc', 'ac', 'odd_h', 'odd_d', 'odd_a', 'h_form', 'h_att', 'h_def', 'a_form', 'a_att', 'a_def'])
         probs = model.predict_proba(in_data)[0]
@@ -185,42 +182,36 @@ def predict_rf(model, le, home, away, oh, od, oa, stats_df):
         return ph_p, pd_p, pa_p
     except: return 0.33, 0.33, 0.34
 
-def run_backtest(df, model_type, model_obj=None, le=None, dc_stats=None):
+def run_backtest_blind(df_full, model_type):
     """
-    Backtest corregido que usa los datos pre-calculados del DataFrame
-    para evitar errores de búsqueda y obtener predicciones reales de la IA.
+    Backtest Realista (Blind Test).
+    Entrena con el pasado, prueba con el futuro (últimos 20).
     """
-    recent = df.tail(20).copy()
+    # 1. Cortar datos: Entreno (todo menos ultimos 20) vs Test (ultimos 20)
+    train_data = df_full.iloc[:-20].copy()
+    test_data = df_full.tail(20).copy()
+    
     log = []
     bal = 0
     correct = 0
     
-    # Features que usa la IA
-    features_ia = ['hc', 'ac', 'odd_h', 'odd_d', 'odd_a', 'h_form', 'h_att', 'h_def', 'a_form', 'a_att', 'a_def']
-    
-    for _, r in recent.iterrows():
-        # Predict based on selected model
+    # 2. Entrenar MODELO TEMPORAL
+    if "IA" in model_type:
+        # Entrenamos solo con train_data, pero pasamos df_full para que el encoder sepa los nombres
+        temp_model, temp_le = train_rf(train_data, df_full)
+    else:
+        temp_dc_stats, t_avg_h, t_avg_a = calculate_dc_stats(train_data)
+
+    # 3. Probar en datos desconocidos
+    for _, r in test_data.iterrows():
         if "IA" in model_type:
-            try:
-                # Extraer datos directamente de la fila histórica (ya tiene 'hc', 'ac', etc.)
-                input_row = r[features_ia].values.reshape(1, -1)
-                
-                # Predecir con el modelo ya entrenado
-                probs = model_obj.predict_proba(input_row)[0]
-                
-                pd_p, ph, pa = 0.0, 0.0, 0.0
-                for i, c in enumerate(model_obj.classes_):
-                    if c==0: pd_p=probs[i]
-                    if c==1: ph=probs[i]
-                    if c==2: pa=probs[i]
-            except:
-                ph, pd_p, pa = 0.33, 0.33, 0.34
-                
+            # Usamos los datos de la fila (ya calculados)
+            ph, pd_p, pa = predict_rf(temp_model, temp_le, r['home'], r['away'], r['odd_h'], r['odd_d'], r['odd_a'],
+                                      r['h_form'], r['h_att'], r['h_def'], r['a_form'], r['a_att'], r['a_def'])
         else:
-            # Dixon Coles logic
-            ph, pd_p, pa, _, _ = predict_dc(r['home'], r['away'], dc_stats[0], dc_stats[1], dc_stats[2])
-        
-        # Decide pick
+            ph, pd_p, pa, _, _ = predict_dc(r['home'], r['away'], temp_dc_stats, t_avg_h, t_avg_a)
+            
+        # Decisión
         if ph > pd_p and ph > pa: pick, prob, odd, res_txt = "Local", ph, r['odd_h'], ("Local" if r['result']==1 else "Fallo")
         elif pa > ph and pa > pd_p: pick, prob, odd, res_txt = "Visita", pa, r['odd_a'], ("Visita" if r['result']==2 else "Fallo")
         else: pick, prob, odd, res_txt = "Empate", pd_p, r['odd_d'], ("Empate" if r['result']==0 else "Fallo")
@@ -245,59 +236,64 @@ with st.sidebar:
     raw = fetch_live_soccer_data(code)
     if raw.empty: st.error("Error datos"); st.stop()
     
-    # Process
-    df_pro, stats_hist = calculate_rolling_features(raw)
+    # Feature Engineering Global
+    df_pro = calculate_rolling_features(raw)
     
     st.divider()
     m_type = st.radio("Cerebro:", ["Dixon-Coles (Estadístico)", "Random Forest (IA)"], index=1)
     
-    # Train/Prep Models
+    # Entrenamiento PRINCIPAL (Con TODOS los datos para predecir el futuro real)
     if "IA" in m_type:
-        # Importante: train_rf ahora devuelve el df con 'hc' y 'ac' agregados
-        rf_model, encoder, df_pro_encoded = train_rf(df_pro)
-        st.success(f"🚀 IA Entrenada ({len(df_pro)} partidos)")
+        rf_model_main, encoder_main = train_rf(df_pro, df_pro)
+        st.success(f"🚀 IA Maestra Entrenada ({len(df_pro)} partidos)")
     else:
-        dc_s, avg_h, avg_a = calculate_dc_stats(raw)
-        st.success("📐 Dixon-Coles Listo")
+        dc_s_main, avg_h_main, avg_a_main = calculate_dc_stats(df_pro)
+        st.success("📐 Dixon-Coles Maestro Listo")
     
     st.divider()
     bank = st.number_input("💰 Tu Banco ($)", 1000.0, step=50.0)
 
 st.title(f"⚽ {leagues[code]} - {m_type}")
 
-# Selectors
+# Inputs
 teams = sorted(raw['home'].unique())
 c1, c2 = st.columns(2)
 h_tm = c1.selectbox("Local", teams, index=0)
 a_tm = c2.selectbox("Visitante", [t for t in teams if t != h_tm], index=0)
 
-# Odds Input
 st.info("ℹ️ Ingresa cuotas reales para activar la predicción")
 co1, co2, co3 = st.columns(3)
 oh = co1.number_input("Cuota 1", 1.01, 20.0, 2.0)
 od = co2.number_input("Cuota X", 1.01, 20.0, 3.2)
 oa = co3.number_input("Cuota 2", 1.01, 20.0, 3.5)
 
-# --- PREDICTION ---
+# --- PREDICCIÓN FUTURA (Usamos el modelo maestro) ---
 he, ae = 0, 0
 if "IA" in m_type:
-    ph, pd_p, pa = predict_rf(rf_model, encoder, h_tm, a_tm, oh, od, oa, stats_hist)
-    msg = "IA analizando Cuotas + Forma Reciente (Pts/Goles)"
+    # Obtenemos stats recientes para pasar al modelo
+    h_row = df_pro[df_pro['home']==h_tm].tail(1)
+    a_row = df_pro[df_pro['away']==a_tm].tail(1)
+    
+    # Si es primera jornada, defaults a 0
+    hf, ha, hd = (h_row.iloc[0]['h_form'], h_row.iloc[0]['h_att'], h_row.iloc[0]['h_def']) if not h_row.empty else (0,0,0)
+    af, aa, ad = (a_row.iloc[0]['a_form'], a_row.iloc[0]['a_att'], a_row.iloc[0]['a_def']) if not a_row.empty else (0,0,0)
+    
+    ph, pd_p, pa = predict_rf(rf_model_main, encoder_main, h_tm, a_tm, oh, od, oa, hf, ha, hd, af, aa, ad)
+    msg = "IA Maestra (Toda la temporada)"
 else:
-    ph, pd_p, pa, he, ae = predict_dc(h_tm, a_tm, dc_s, avg_h, avg_a)
-    msg = "Modelo matemático puro (Goles Esperados)"
+    ph, pd_p, pa, he, ae = predict_dc(h_tm, a_tm, dc_s_main, avg_h_main, avg_a_main)
+    msg = "Modelo Matemático Maestro"
 
 # --- TABS ---
 tab1, tab2, tab3, tab4 = st.tabs(["📊 Análisis", "💰 Valor & Apuesta", "📜 Historial", "🧪 Laboratorio"])
 
 with tab1:
-    st.markdown("### 🏆 Probabilidades de Partido")
+    st.markdown("### 🏆 Probabilidades")
     c1, c2, c3 = st.columns(3)
     c1.plotly_chart(plot_gauge(ph, f"Gana {h_tm}", "#4CAF50"), use_container_width=True)
     c2.plotly_chart(plot_gauge(pd_p, "Empate", "#FFC107"), use_container_width=True)
     c3.plotly_chart(plot_gauge(pa, f"Gana {a_tm}", "#2196F3"), use_container_width=True)
-    
-    st.caption(f"🧠 Lógica: {msg}")
+    st.caption(f"🧠 {msg}")
     
     if he > 0:
         st.markdown("### 🥅 Goles Esperados")
@@ -306,7 +302,7 @@ with tab1:
         m2.metric("Total", f"{he+ae:.2f}")
         m3.metric(a_tm, f"{ae:.2f}")
 
-    st.markdown("### 📉 Forma Reciente (Últimos 5)")
+    st.markdown("### 📉 Forma Reciente")
     cf1, cf2 = st.columns(2)
     with cf1: st.dataframe(get_last_5(raw, h_tm), use_container_width=True, hide_index=True)
     with cf2: st.dataframe(get_last_5(raw, a_tm), use_container_width=True, hide_index=True)
@@ -343,12 +339,12 @@ with tab2:
             st.success("Guardado!"); st.rerun()
 
 with tab3:
-    st.markdown("### 📜 Historial de Apuestas")
+    st.markdown("### 📜 Historial")
     db = manage_bets("load")
     if not db.empty:
         st.metric("Balance Total", f"${db['Ganancia'].sum():.2f}", delta_color="normal")
         st.dataframe(db.sort_values(by="Fecha", ascending=False), use_container_width=True)
-        with st.expander("Actualizar Estado"):
+        with st.expander("Actualizar"):
             pen = db[db['Estado']=='Pendiente']
             if not pen.empty:
                 bid = st.selectbox("ID", pen['ID'].unique())
@@ -358,18 +354,21 @@ with tab3:
     else: st.info("Historial vacío")
 
 with tab4:
-    st.markdown("### 🧪 Laboratorio de Backtesting")
-    st.info("Pon a prueba el modelo seleccionado con los últimos 20 partidos.")
-    if st.button("▶️ Ejecutar Simulación"):
-        # Prepare inputs based on model type
-        if "IA" in m_type:
-            # Pasa el dataframe YA codificado (con hc, ac) para que el backtest lo lea directo
-            test_df, ok, profit = run_backtest(df_pro_encoded, m_type, model_obj=rf_model, le=encoder)
-        else:
-            test_df, ok, profit = run_backtest(df_pro, m_type, dc_stats=(dc_s, avg_h, avg_a))
+    st.markdown("### 🧪 Backtesting Realista (Blind Test)")
+    st.info("Esta prueba entrena al modelo con el pasado y lo prueba con los últimos 20 partidos (que nunca ha visto). ¡Sin trampas!")
+    
+    if st.button("▶️ Ejecutar Simulación Ciega"):
+        with st.spinner("Entrenando modelo temporal sin mirar el futuro..."):
+            test_df, ok, profit = run_backtest_blind(df_pro, m_type)
         
+        acc = (ok/20)*100
         m1, m2, m3 = st.columns(3)
-        m1.metric("Aciertos", f"{ok}/20 ({ok/20*100:.0f}%)")
-        m2.metric("Profit (Stake 1U)", f"{profit:.2f} U", delta="Ganancia" if profit>0 else "Pérdida")
-        m3.metric("Estado", "🔥 Rentable" if profit > 0 else "❄️ Frío")
+        m1.metric("Aciertos Reales", f"{ok}/20 ({acc:.0f}%)")
+        m2.metric("Profit Real (Stake 1U)", f"{profit:.2f} U", delta="Ganancia" if profit>0 else "Pérdida")
+        
+        if profit > 0: st.balloons(); status = "🔥 Muy Rentable"
+        elif profit > -2: status = "😐 Estable"
+        else: status = "❄️ No Rentable hoy"
+        m3.metric("Veredicto", status)
+        
         st.dataframe(test_df, use_container_width=True)
