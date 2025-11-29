@@ -10,7 +10,7 @@ from sklearn.preprocessing import LabelEncoder
 # ======================================================
 # 1. CONFIGURACIÓN
 # ======================================================
-st.set_page_config(page_title="AI Soccer Analyst", layout="wide", page_icon="🤖")
+st.set_page_config(page_title="AI Soccer NASA", layout="wide", page_icon="🚀")
 CSV_FILE = 'mis_apuestas_ml.csv'
 
 st.markdown("""
@@ -26,7 +26,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ======================================================
-# 2. CARGA DE DATOS
+# 2. INGENIERÍA DE DATOS (EL CEREBRO NUEVO) 🧠
 # ======================================================
 @st.cache_data
 def fetch_live_soccer_data(league_code="SP1"):
@@ -45,41 +45,79 @@ def fetch_live_soccer_data(league_code="SP1"):
         }
         df = df.rename(columns=mapping).dropna()
         df['date'] = pd.to_datetime(df['date'], dayfirst=True, errors='coerce')
+        df = df.sort_values('date') # Importante ordenar por fecha
         
-        # CREAMOS LA COLUMNA "RESULTADO" (TARGET) PARA QUE LA IA APRENDA
-        # 0 = Empate, 1 = Local, 2 = Visitante
+        # TARGET: 0=Draw, 1=Home, 2=Away
         conditions = [
             (df['home_goals'] > df['away_goals']),
             (df['home_goals'] < df['away_goals'])
         ]
-        choices = [1, 2] # 1: Home Win, 2: Away Win
-        df['result'] = np.select(conditions, choices, default=0) # 0: Draw
+        df['result'] = np.select(conditions, [1, 2], default=0)
         
         return df
     except: return pd.DataFrame()
 
+def calculate_rolling_features(df):
+    """
+    Crea estadísticas de forma reciente (últimos 3 partidos) para cada equipo.
+    Esta es la parte difícil: convertir formato Local-Visitante a formato Equipo-Partido.
+    """
+    # 1. Creamos un DataFrame vertical (Un equipo por fila)
+    home_df = df[['date', 'home', 'home_goals', 'away_goals', 'result']].copy()
+    home_df.columns = ['date', 'team', 'gf', 'ga', 'res_match']
+    home_df['points'] = np.where(home_df['res_match']==1, 3, np.where(home_df['res_match']==0, 1, 0))
+    home_df['is_home'] = 1
+
+    away_df = df[['date', 'away', 'away_goals', 'home_goals', 'result']].copy()
+    away_df.columns = ['date', 'team', 'gf', 'ga', 'res_match']
+    away_df['points'] = np.where(away_df['res_match']==2, 3, np.where(away_df['res_match']==0, 1, 0))
+    away_df['is_home'] = 0
+
+    # 2. Concatenamos y ordenamos
+    team_stats = pd.concat([home_df, away_df]).sort_values(['team', 'date'])
+
+    # 3. Calculamos Rolling Averages (Últimos 3 partidos)
+    # .shift() es vital: No podemos usar el partido de HOY para predecir HOY.
+    window = 3
+    team_stats['form_points'] = team_stats.groupby('team')['points'].transform(lambda x: x.rolling(window, min_periods=1).sum().shift(1))
+    team_stats['form_gf'] = team_stats.groupby('team')['gf'].transform(lambda x: x.rolling(window, min_periods=1).mean().shift(1))
+    team_stats['form_ga'] = team_stats.groupby('team')['ga'].transform(lambda x: x.rolling(window, min_periods=1).mean().shift(1))
+
+    # Rellenamos NaN (primeros partidos de liga) con 0
+    team_stats = team_stats.fillna(0)
+
+    # 4. Volvemos a pegar estos datos en el DataFrame original (Join)
+    # Unimos datos del LOCAL
+    df = df.merge(team_stats[['date', 'team', 'form_points', 'form_gf', 'form_ga']], 
+                  left_on=['date', 'home'], right_on=['date', 'team'], how='left')
+    df = df.rename(columns={'form_points': 'h_form', 'form_gf': 'h_att_recent', 'form_ga': 'h_def_recent'})
+    df = df.drop(columns=['team'])
+
+    # Unimos datos del VISITANTE
+    df = df.merge(team_stats[['date', 'team', 'form_points', 'form_gf', 'form_ga']], 
+                  left_on=['date', 'away'], right_on=['date', 'team'], how='left')
+    df = df.rename(columns={'form_points': 'a_form', 'form_gf': 'a_att_recent', 'form_ga': 'a_def_recent'})
+    df = df.drop(columns=['team'])
+
+    return df, team_stats # Retornamos también team_stats para buscar info actual
+
 # ======================================================
-# 3. MODELO 1: DIXON-COLES (ESTADÍSTICO)
+# 3. MODELO 1: DIXON-COLES
 # ======================================================
 def calculate_strengths(df):
-    # ... (Tu código de Dixon-Coles original se mantiene aquí para cuando elijas ese modo) ...
     last_date = df['date'].max()
     df['days_ago'] = (last_date - df['date']).dt.days
     df['weight'] = np.exp(-0.005 * df['days_ago'])
-    
     avg_h = np.average(df['home_goals'], weights=df['weight'])
     avg_a = np.average(df['away_goals'], weights=df['weight'])
-    
     stats = {}
     for team in set(df['home'].unique()) | set(df['away'].unique()):
         h_m = df[df['home'] == team]
         a_m = df[df['away'] == team]
-        
         att_h = np.average(h_m['home_goals'], weights=h_m['weight'])/avg_h if not h_m.empty else 1.0
         def_h = np.average(h_m['away_goals'], weights=h_m['weight'])/avg_a if not h_m.empty else 1.0
         att_a = np.average(a_m['away_goals'], weights=a_m['weight'])/avg_a if not a_m.empty else 1.0
         def_a = np.average(a_m['home_goals'], weights=a_m['weight'])/avg_h if not a_m.empty else 1.0
-        
         stats[team] = {'att_h': att_h, 'def_h': def_h, 'att_a': att_a, 'def_a': def_a}
     return stats, avg_h, avg_a
 
@@ -89,7 +127,6 @@ def predict_dixon_coles(home, away, stats, avg_h, avg_a):
     max_g = 10
     probs = np.zeros((max_g, max_g))
     rho = -0.13
-    
     for x in range(max_g):
         for y in range(max_g):
             p = poisson.pmf(x, h_exp) * poisson.pmf(y, a_exp)
@@ -99,22 +136,18 @@ def predict_dixon_coles(home, away, stats, avg_h, avg_a):
             elif x==1 and y==1: c = 1 - rho
             else: c = 1.0
             probs[x][y] = p * c
-            
     probs = np.maximum(0, probs)
     probs = probs / probs.sum()
-    
     ph = np.tril(probs, -1).sum()
-    pd = np.diag(probs).sum()
+    pd_prob = np.diag(probs).sum()
     pa = np.triu(probs, 1).sum()
-    return ph, pd, pa, h_exp, a_exp
+    return ph, pd_prob, pa, h_exp, a_exp
 
 # ======================================================
-# 4. MODELO 2: RANDOM FOREST (MACHINE LEARNING) 🤖
+# 4. MODELO 2: RANDOM FOREST AVANZADO (FORMA RECIENTE) 🤖
 # ======================================================
 def train_ai_model(df):
-    """Entrena una IA para predecir el ganador basándose en Cuotas y Equipos"""
-    # 1. Preparamos los datos
-    # La IA no entiende nombres como "Barcelona", hay que convertirlos a números
+    """Entrena Random Forest con Historial + Forma Reciente"""
     le = LabelEncoder()
     all_teams = pd.concat([df['home'], df['away']]).unique()
     le.fit(all_teams)
@@ -122,50 +155,60 @@ def train_ai_model(df):
     df['home_code'] = le.transform(df['home'])
     df['away_code'] = le.transform(df['away'])
     
-    # 2. Definimos las "Features" (Qué datos mira la IA)
-    # Mira: Quién juega (codificado) y qué dicen las casas de apuestas (Cuotas)
-    features = ['home_code', 'away_code', 'odd_h', 'odd_d', 'odd_a']
-    X = df[features]
-    y = df['result'] # Lo que queremos predecir (0, 1, 2)
+    # FEATURES AVANZADAS:
+    # IDs + Cuotas + Forma Local (Puntos, Ataque, Defensa) + Forma Visita
+    features = ['home_code', 'away_code', 'odd_h', 'odd_d', 'odd_a',
+                'h_form', 'h_att_recent', 'h_def_recent',
+                'a_form', 'a_att_recent', 'a_def_recent']
     
-    # 3. Entrenamos el Cerebro (Random Forest)
-    # n_estimators=100 significa que crea 100 árboles de decisión mentales
-    model = RandomForestClassifier(n_estimators=100, random_state=42)
+    X = df[features]
+    y = df['result']
+    
+    model = RandomForestClassifier(n_estimators=100, max_depth=10, random_state=42)
     model.fit(X, y)
     
     return model, le
 
-def predict_ai(model, le, home, away, odd_h, odd_d, odd_a):
-    """Usa la IA entrenada para predecir un partido futuro"""
+def get_latest_team_stats(team, team_stats_df):
+    """Busca los datos más recientes de un equipo para predecir el futuro"""
+    team_data = team_stats_df[team_stats_df['team'] == team].tail(1)
+    if team_data.empty: return 0, 0, 0 # Sin datos
+    # Para el futuro, su 'Rolling' incluye el último partido jugado
+    # Simplemente recalculamos rápido el rolling de los últimos 3
+    last_3 = team_stats_df[team_stats_df['team'] == team].tail(3)
+    form = last_3['points'].sum()
+    att = last_3['gf'].mean()
+    deff = last_3['ga'].mean()
+    return form, att, deff
+
+def predict_ai_advanced(model, le, team_stats_df, home, away, odd_h, odd_d, odd_a):
     try:
-        # Preparamos los datos del partido futuro igual que los de entrenamiento
         h_code = le.transform([home])[0]
         a_code = le.transform([away])[0]
         
-        # La IA necesita ver los datos en el mismo orden
-        input_data = pd.DataFrame([[h_code, a_code, odd_h, odd_d, odd_a]], 
-                                columns=['home_code', 'away_code', 'odd_h', 'odd_d', 'odd_a'])
+        # Obtener forma reciente REAL
+        h_form, h_att, h_def = get_latest_team_stats(home, team_stats_df)
+        a_form, a_att, a_def = get_latest_team_stats(away, team_stats_df)
         
-        # .predict_proba() nos da los porcentajes [Prob_Empate, Prob_Local, Prob_Visita]
+        input_data = pd.DataFrame([[h_code, a_code, odd_h, odd_d, odd_a,
+                                    h_form, h_att, h_def, a_form, a_att, a_def]], 
+                                columns=['home_code', 'away_code', 'odd_h', 'odd_d', 'odd_a',
+                                         'h_form', 'h_att_recent', 'h_def_recent',
+                                         'a_form', 'a_att_recent', 'a_def_recent'])
+        
         probs = model.predict_proba(input_data)[0]
         
-        # Random Forest a veces devuelve el orden distinto, aseguramos:
-        # Las clases suelen ser ordenadas: 0 (Draw), 1 (Home), 2 (Away)
-        # Nota: Sklearn ordena las clases numéricamente.
-        
-        # Mapeo seguro
         classes = model.classes_
         p_draw, p_home, p_away = 0.0, 0.0, 0.0
-        
         for i, class_val in enumerate(classes):
             if class_val == 0: p_draw = probs[i]
             if class_val == 1: p_home = probs[i]
             if class_val == 2: p_away = probs[i]
             
-        return p_home, p_draw, p_away
+        return p_home, p_draw, p_away, h_form, a_form
         
     except Exception as e:
-        return 0.33, 0.33, 0.34 # Fallback si hay error (equipos nuevos)
+        return 0.33, 0.33, 0.34, 0, 0
 
 # ======================================================
 # 5. INTERFAZ GRÁFICA
@@ -175,47 +218,46 @@ with st.sidebar:
     leagues = {"SP1": "🇪🇸 La Liga", "E0": "🏴󠁧󠁢󠁥󠁮󠁧󠁿 Premier League", "I1": "🇮🇹 Serie A", "D1": "🇩🇪 Bundesliga"}
     code = st.selectbox("Liga", list(leagues.keys()), format_func=lambda x: leagues[x])
     
-    df = fetch_live_soccer_data(code)
-    if df.empty: st.error("Error datos"); st.stop()
+    raw_df = fetch_live_soccer_data(code)
+    if raw_df.empty: st.error("Error datos"); st.stop()
     
-    # --- SELECTOR DE CEREBRO ---
+    # PROCESAMIENTO
+    df_processed, team_stats_history = calculate_rolling_features(raw_df)
+    
     st.divider()
-    st.markdown("### 🧠 Selecciona tu Inteligencia")
-    model_type = st.radio("Modelo:", ["Dixon-Coles (Matemático)", "Random Forest (IA)"], index=0)
+    model_type = st.radio("Cerebro:", ["Dixon-Coles (Stats)", "Random Forest (IA Avanzada)"], index=1)
     
-    # Entrenar modelos según selección
     if "IA" in model_type:
-        ai_model, encoder = train_ai_model(df)
-        st.success(f"🤖 IA Entrenada con {len(df)} partidos")
+        ai_model, encoder = train_ai_model(df_processed)
+        st.success(f"🚀 IA Entrenada con {len(df_processed)} partidos + Forma Reciente")
     else:
-        stats, ah, aa = calculate_strengths(df)
-        st.success(f"📐 Estadística calculada")
+        stats, ah, aa = calculate_strengths(raw_df)
+        st.success("📐 Modelo Estadístico Listo")
 
 st.title(f"⚽ {leagues[code]} - {model_type}")
 
-# Selección de equipos
-teams = sorted(pd.concat([df['home'], df['away']]).unique())
+teams = sorted(raw_df['home'].unique())
 c1, c2 = st.columns(2)
 home = c1.selectbox("Local", teams, index=0)
 away = c2.selectbox("Visitante", [t for t in teams if t != home], index=0)
 
-# INPUTS DE CUOTAS (Necesarios para la IA)
-st.info("ℹ️ Para la IA, las cuotas son vitales. Introduce las cuotas reales de hoy.")
+st.info("ℹ️ Ingresa cuotas reales para activar la predicción")
 co1, co2, co3 = st.columns(3)
-odd_h = co1.number_input("Cuota Local", 1.01, 20.0, 2.0)
-odd_d = co2.number_input("Cuota Empate", 1.01, 20.0, 3.2)
-odd_a = co3.number_input("Cuota Visita", 1.01, 20.0, 3.5)
+odd_h = co1.number_input("Cuota 1", 1.01, 20.0, 2.0)
+odd_d = co2.number_input("Cuota X", 1.01, 20.0, 3.2)
+odd_a = co3.number_input("Cuota 2", 1.01, 20.0, 3.5)
 
-# --- EJECUCIÓN DEL CEREBRO ---
+# --- EJECUCIÓN ---
+h_points_recent, a_points_recent = 0, 0
+
 if "IA" in model_type:
-    # Predicción Machine Learning
-    ph, pd_prob, pa = predict_ai(ai_model, encoder, home, away, odd_h, odd_d, odd_a)
-    h_exp, a_exp = 0, 0 # La IA Random Forest no calcula goles esperados directamente
-    msg_model = "Basado en patrones de apuestas y resultados previos."
+    ph, pd_prob, pa, h_points_recent, a_points_recent = predict_ai_advanced(
+        ai_model, encoder, team_stats_history, home, away, odd_h, odd_d, odd_a)
+    h_exp, a_exp = 0, 0
+    model_msg = "IA analizando cuotas + Puntos últimos 3 partidos"
 else:
-    # Predicción Dixon-Coles
     ph, pd_prob, pa, h_exp, a_exp = predict_dixon_coles(home, away, stats, ah, aa)
-    msg_model = "Basado en fuerza de ataque y defensa."
+    model_msg = "Modelo estadístico puro"
 
 # --- VISUALIZACIÓN ---
 st.divider()
@@ -231,9 +273,10 @@ g1.plotly_chart(plot_gauge(ph, f"Gana {home}", "#4CAF50"), use_container_width=T
 g2.plotly_chart(plot_gauge(pd_prob, "Empate", "#FFC107"), use_container_width=True)
 g3.plotly_chart(plot_gauge(pa, f"Gana {away}", "#2196F3"), use_container_width=True)
 
-st.caption(f"🧠 Lógica: {msg_model}")
+if "IA" in model_type:
+    st.caption(f"📊 Datos usados por la IA: {home} ({h_points_recent}/9 ptos recientes) vs {away} ({a_points_recent}/9 ptos recientes)")
 
-# Valor Esperado (EV)
+# Valor Esperado
 ev_h = (ph * odd_h) - 1
 ev_d = (pd_prob * odd_d) - 1
 ev_a = (pa * odd_a) - 1
