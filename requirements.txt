@@ -1,9 +1,7 @@
-streamlit
-pandas
-numpy
-scipy
-plotlystreamlit
+streamlit>=1.32.0
 pandas
 numpy
 scipy
 plotly
+watchdog
+scikit-learn
