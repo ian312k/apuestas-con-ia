@@ -26,7 +26,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ======================================================
-# 2. INGENIERÍA DE DATOS Y UTILIDADES
+# 2. INGENIERÍA DE DATOS
 # ======================================================
 @st.cache_data
 def fetch_live_soccer_data(league_code="SP1"):
@@ -40,6 +40,7 @@ def fetch_live_soccer_data(league_code="SP1"):
                    'B365H': 'odd_h', 'B365D': 'odd_d', 'B365A': 'odd_a', 'HST': 'home_shots', 'AST': 'away_shots'}
         df = df.rename(columns=mapping).dropna().sort_values('date')
         df['date'] = pd.to_datetime(df['date'], dayfirst=True, errors='coerce')
+        
         # Target: 1=Home, 2=Away, 0=Draw
         conditions = [(df['home_goals'] > df['away_goals']), (df['home_goals'] < df['away_goals'])]
         df['result'] = np.select(conditions, [1, 2], default=0)
@@ -48,7 +49,6 @@ def fetch_live_soccer_data(league_code="SP1"):
 
 def calculate_rolling_features(df):
     """Crea estadísticas de forma reciente (últimos 3 partidos)"""
-    # Preparar DF vertical
     h_df = df[['date', 'home', 'home_goals', 'away_goals', 'result']].rename(columns={'home':'team', 'home_goals':'gf', 'away_goals':'ga', 'result':'res'})
     h_df['pts'] = np.where(h_df['res']==1, 3, np.where(h_df['res']==0, 1, 0))
     a_df = df[['date', 'away', 'away_goals', 'home_goals', 'result']].rename(columns={'away':'team', 'away_goals':'gf', 'home_goals':'ga', 'result':'res'})
@@ -63,6 +63,9 @@ def calculate_rolling_features(df):
     # Merge back
     df = df.merge(stats[['date', 'team', 'roll_pts', 'roll_gf', 'roll_ga']], left_on=['date', 'home'], right_on=['date', 'team'], how='left').rename(columns={'roll_pts':'h_form', 'roll_gf':'h_att', 'roll_ga':'h_def'}).drop(columns=['team'])
     df = df.merge(stats[['date', 'team', 'roll_pts', 'roll_gf', 'roll_ga']], left_on=['date', 'away'], right_on=['date', 'team'], how='left').rename(columns={'roll_pts':'a_form', 'roll_gf':'a_att', 'roll_ga':'a_def'}).drop(columns=['team'])
+    
+    # Rellenar nulos por si acaso
+    df = df.fillna(0)
     return df, stats
 
 def manage_bets(mode, data=None, id_bet=None, status=None):
@@ -144,13 +147,20 @@ def predict_dc(home, away, stats, avg_h, avg_a):
 # --- Random Forest ---
 def train_rf(df):
     le = LabelEncoder()
+    # Entrenamos encoder con todos los equipos posibles
     le.fit(pd.concat([df['home'], df['away']]).unique())
+    
+    # Creamos columnas codificadas EN EL DATAFRAME para que el Backtest las vea
     df['hc'] = le.transform(df['home'])
     df['ac'] = le.transform(df['away'])
+    
     feats = ['hc', 'ac', 'odd_h', 'odd_d', 'odd_a', 'h_form', 'h_att', 'h_def', 'a_form', 'a_att', 'a_def']
+    
+    # Entrenar modelo
     model = RandomForestClassifier(n_estimators=100, max_depth=10, random_state=42)
     model.fit(df[feats], df['result'])
-    return model, le
+    
+    return model, le, df # Devolvemos el df modificado con 'hc' y 'ac'
 
 def predict_rf(model, le, home, away, oh, od, oa, stats_df):
     try:
@@ -159,7 +169,7 @@ def predict_rf(model, le, home, away, oh, od, oa, stats_df):
         h_st = stats_df[stats_df['team']==home].tail(1)
         a_st = stats_df[stats_df['team']==away].tail(1)
         
-        # Safe fetch
+        # Safe fetch stats
         hf, ha, hd = (h_st.iloc[0]['roll_pts']*3, h_st.iloc[0]['roll_gf'], h_st.iloc[0]['roll_ga']) if not h_st.empty else (0,0,0)
         af, aa, ad = (a_st.iloc[0]['roll_pts']*3, a_st.iloc[0]['roll_gf'], a_st.iloc[0]['roll_ga']) if not a_st.empty else (0,0,0)
 
@@ -167,7 +177,6 @@ def predict_rf(model, le, home, away, oh, od, oa, stats_df):
                                columns=['hc', 'ac', 'odd_h', 'odd_d', 'odd_a', 'h_form', 'h_att', 'h_def', 'a_form', 'a_att', 'a_def'])
         probs = model.predict_proba(in_data)[0]
         
-        # Map classes (0=Draw, 1=Home, 2=Away)
         pd_p, ph_p, pa_p = 0.0, 0.0, 0.0
         for i, c in enumerate(model.classes_):
             if c==0: pd_p=probs[i]
@@ -177,17 +186,38 @@ def predict_rf(model, le, home, away, oh, od, oa, stats_df):
     except: return 0.33, 0.33, 0.34
 
 def run_backtest(df, model_type, model_obj=None, le=None, dc_stats=None):
+    """
+    Backtest corregido que usa los datos pre-calculados del DataFrame
+    para evitar errores de búsqueda y obtener predicciones reales de la IA.
+    """
     recent = df.tail(20).copy()
     log = []
     bal = 0
     correct = 0
     
+    # Features que usa la IA
+    features_ia = ['hc', 'ac', 'odd_h', 'odd_d', 'odd_a', 'h_form', 'h_att', 'h_def', 'a_form', 'a_att', 'a_def']
+    
     for _, r in recent.iterrows():
         # Predict based on selected model
         if "IA" in model_type:
-            # Note: Testing on training data is optimistic, but valid for checking model logic
-            ph, pd_p, pa = predict_rf(model_obj, le, r['home'], r['away'], r['odd_h'], r['odd_d'], r['odd_a'], df) # using df as stats source for simplicity
+            try:
+                # Extraer datos directamente de la fila histórica (ya tiene 'hc', 'ac', etc.)
+                input_row = r[features_ia].values.reshape(1, -1)
+                
+                # Predecir con el modelo ya entrenado
+                probs = model_obj.predict_proba(input_row)[0]
+                
+                pd_p, ph, pa = 0.0, 0.0, 0.0
+                for i, c in enumerate(model_obj.classes_):
+                    if c==0: pd_p=probs[i]
+                    if c==1: ph=probs[i]
+                    if c==2: pa=probs[i]
+            except:
+                ph, pd_p, pa = 0.33, 0.33, 0.34
+                
         else:
+            # Dixon Coles logic
             ph, pd_p, pa, _, _ = predict_dc(r['home'], r['away'], dc_stats[0], dc_stats[1], dc_stats[2])
         
         # Decide pick
@@ -205,7 +235,7 @@ def run_backtest(df, model_type, model_obj=None, le=None, dc_stats=None):
     return pd.DataFrame(log), correct, bal
 
 # ======================================================
-# 4. INTERFAZ GRÁFICA (RESTORED TABS)
+# 4. INTERFAZ GRÁFICA
 # ======================================================
 with st.sidebar:
     st.header("⚙️ Configuración")
@@ -223,7 +253,8 @@ with st.sidebar:
     
     # Train/Prep Models
     if "IA" in m_type:
-        rf_model, encoder = train_rf(df_pro)
+        # Importante: train_rf ahora devuelve el df con 'hc' y 'ac' agregados
+        rf_model, encoder, df_pro_encoded = train_rf(df_pro)
         st.success(f"🚀 IA Entrenada ({len(df_pro)} partidos)")
     else:
         dc_s, avg_h, avg_a = calculate_dc_stats(raw)
@@ -256,7 +287,7 @@ else:
     ph, pd_p, pa, he, ae = predict_dc(h_tm, a_tm, dc_s, avg_h, avg_a)
     msg = "Modelo matemático puro (Goles Esperados)"
 
-# --- TABS (THEY ARE BACK!) ---
+# --- TABS ---
 tab1, tab2, tab3, tab4 = st.tabs(["📊 Análisis", "💰 Valor & Apuesta", "📜 Historial", "🧪 Laboratorio"])
 
 with tab1:
@@ -268,7 +299,7 @@ with tab1:
     
     st.caption(f"🧠 Lógica: {msg}")
     
-    if he > 0: # Only for Dixon Coles
+    if he > 0:
         st.markdown("### 🥅 Goles Esperados")
         m1, m2, m3 = st.columns(3)
         m1.metric(h_tm, f"{he:.2f}")
@@ -282,7 +313,6 @@ with tab1:
 
 with tab2:
     st.markdown("### 🏦 Cazador de Valor")
-    # Kelly Calculation
     ev_h, kh = (ph*oh)-1, calculate_kelly(ph, oh)
     ev_d, kd = (pd_p*od)-1, calculate_kelly(pd_p, od)
     ev_a, ka = (pa*oa)-1, calculate_kelly(pa, oa)
@@ -332,11 +362,11 @@ with tab4:
     st.info("Pon a prueba el modelo seleccionado con los últimos 20 partidos.")
     if st.button("▶️ Ejecutar Simulación"):
         # Prepare inputs based on model type
-        obj = rf_model if "IA" in m_type else None
-        enc = encoder if "IA" in m_type else None
-        dcs = (dc_s, avg_h, avg_a) if "Dixon" in m_type else None
-        
-        test_df, ok, profit = run_backtest(df_pro, m_type, obj, enc, dcs)
+        if "IA" in m_type:
+            # Pasa el dataframe YA codificado (con hc, ac) para que el backtest lo lea directo
+            test_df, ok, profit = run_backtest(df_pro_encoded, m_type, model_obj=rf_model, le=encoder)
+        else:
+            test_df, ok, profit = run_backtest(df_pro, m_type, dc_stats=(dc_s, avg_h, avg_a))
         
         m1, m2, m3 = st.columns(3)
         m1.metric("Aciertos", f"{ok}/20 ({ok/20*100:.0f}%)")
