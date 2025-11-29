@@ -8,9 +8,9 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import LabelEncoder
 
 # ======================================================
-# 1. CONFIGURACIÓN Y ESTILOS
+# 1. CONFIGURACIÓN
 # ======================================================
-st.set_page_config(page_title="AI Betting Suite", layout="wide", page_icon="🚀")
+st.set_page_config(page_title="Sniper AI Betting", layout="wide", page_icon="🎯")
 CSV_FILE = 'mis_apuestas_ml.csv'
 
 st.markdown("""
@@ -22,6 +22,7 @@ st.markdown("""
         border-radius: 10px;
     }
     h1, h2, h3 { text-align: center; }
+    .big-font { font-size:20px !important; font-weight: bold; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -40,37 +41,28 @@ def fetch_live_soccer_data(league_code="SP1"):
                    'B365H': 'odd_h', 'B365D': 'odd_d', 'B365A': 'odd_a', 'HST': 'home_shots', 'AST': 'away_shots'}
         df = df.rename(columns=mapping).dropna().sort_values('date')
         df['date'] = pd.to_datetime(df['date'], dayfirst=True, errors='coerce')
-        
-        # Target: 1=Home, 2=Away, 0=Draw
         conditions = [(df['home_goals'] > df['away_goals']), (df['home_goals'] < df['away_goals'])]
         df['result'] = np.select(conditions, [1, 2], default=0)
         return df
     except: return pd.DataFrame()
 
 def calculate_rolling_features(df):
-    """Crea estadísticas de forma reciente (últimos 3 partidos)"""
     h_df = df[['date', 'home', 'home_goals', 'away_goals', 'result']].rename(columns={'home':'team', 'home_goals':'gf', 'away_goals':'ga', 'result':'res'})
     h_df['pts'] = np.where(h_df['res']==1, 3, np.where(h_df['res']==0, 1, 0))
     a_df = df[['date', 'away', 'away_goals', 'home_goals', 'result']].rename(columns={'away':'team', 'away_goals':'gf', 'home_goals':'ga', 'result':'res'})
     a_df['pts'] = np.where(a_df['res']==2, 3, np.where(a_df['res']==0, 1, 0))
     
     stats = pd.concat([h_df, a_df]).sort_values(['team', 'date'])
-    
-    # Rolling 3
     for col in ['pts', 'gf', 'ga']:
         stats[f'roll_{col}'] = stats.groupby('team')[col].transform(lambda x: x.rolling(3, min_periods=1).mean().shift(1)).fillna(0)
     
-    # Merge back
     df = df.merge(stats[['date', 'team', 'roll_pts', 'roll_gf', 'roll_ga']], left_on=['date', 'home'], right_on=['date', 'team'], how='left').rename(columns={'roll_pts':'h_form', 'roll_gf':'h_att', 'roll_ga':'h_def'}).drop(columns=['team'])
     df = df.merge(stats[['date', 'team', 'roll_pts', 'roll_gf', 'roll_ga']], left_on=['date', 'away'], right_on=['date', 'team'], how='left').rename(columns={'roll_pts':'a_form', 'roll_gf':'a_att', 'roll_ga':'a_def'}).drop(columns=['team'])
-    
-    df = df.fillna(0)
-    return df
+    return df.fillna(0)
 
 def manage_bets(mode, data=None, id_bet=None, status=None):
     if os.path.exists(CSV_FILE): df = pd.read_csv(CSV_FILE)
     else: df = pd.DataFrame(columns=["ID", "Fecha", "Liga", "Partido", "Pick", "Cuota", "Stake", "Prob", "Estado", "Ganancia"])
-    
     if mode == "save":
         df = pd.concat([df, pd.DataFrame([data])], ignore_index=True)
         df.to_csv(CSV_FILE, index=False)
@@ -107,7 +99,6 @@ def plot_gauge(val, title, color):
 # ======================================================
 # 3. MODELOS (AI & DIXON-COLES)
 # ======================================================
-# --- Dixon Coles ---
 def calculate_dc_stats(df):
     last = df['date'].max()
     df['days'] = (last - df['date']).dt.days
@@ -143,28 +134,15 @@ def predict_dc(home, away, stats, avg_h, avg_a):
     probs /= probs.sum()
     return np.tril(probs,-1).sum(), np.diag(probs).sum(), np.triu(probs,1).sum(), he, ae
 
-# --- Random Forest ---
-def train_rf(df_train, df_full_for_encoding):
-    """
-    Entrena la IA.
-    NOTA: Recibe df_full_for_encoding solo para que el LabelEncoder
-    conozca todos los equipos posibles y no falle si en el futuro aparece uno nuevo.
-    """
+def train_rf(df_train, df_full_encoding):
     le = LabelEncoder()
-    # Entrenar encoder con TODOS los equipos de la liga (pasado y futuro)
-    all_teams = pd.concat([df_full_for_encoding['home'], df_full_for_encoding['away']]).unique()
-    le.fit(all_teams)
-    
-    # Pero entrenar el modelo SOLO con df_train
+    le.fit(pd.concat([df_full_encoding['home'], df_full_encoding['away']]).unique())
     df_train = df_train.copy()
     df_train['hc'] = le.transform(df_train['home'])
     df_train['ac'] = le.transform(df_train['away'])
-    
     feats = ['hc', 'ac', 'odd_h', 'odd_d', 'odd_a', 'h_form', 'h_att', 'h_def', 'a_form', 'a_att', 'a_def']
-    
     model = RandomForestClassifier(n_estimators=100, max_depth=10, random_state=42)
     model.fit(df_train[feats], df_train['result'])
-    
     return model, le
 
 def predict_rf(model, le, home, away, oh, od, oa, hf, ha, hd, af, aa, ad):
@@ -173,7 +151,6 @@ def predict_rf(model, le, home, away, oh, od, oa, hf, ha, hd, af, aa, ad):
         in_data = pd.DataFrame([[hc, ac, oh, od, oa, hf, ha, hd, af, aa, ad]], 
                                columns=['hc', 'ac', 'odd_h', 'odd_d', 'odd_a', 'h_form', 'h_att', 'h_def', 'a_form', 'a_att', 'a_def'])
         probs = model.predict_proba(in_data)[0]
-        
         pd_p, ph_p, pa_p = 0.0, 0.0, 0.0
         for i, c in enumerate(model.classes_):
             if c==0: pd_p=probs[i]
@@ -182,48 +159,43 @@ def predict_rf(model, le, home, away, oh, od, oa, hf, ha, hd, af, aa, ad):
         return ph_p, pd_p, pa_p
     except: return 0.33, 0.33, 0.34
 
-def run_backtest_blind(df_full, model_type):
-    """
-    Backtest Realista (Blind Test).
-    Entrena con el pasado, prueba con el futuro (últimos 20).
-    """
-    # 1. Cortar datos: Entreno (todo menos ultimos 20) vs Test (ultimos 20)
+def run_backtest_blind(df_full, model_type, min_conf=0.0):
     train_data = df_full.iloc[:-20].copy()
     test_data = df_full.tail(20).copy()
+    log, bal, correct, skipped = [], 0, 0, 0
     
-    log = []
-    bal = 0
-    correct = 0
-    
-    # 2. Entrenar MODELO TEMPORAL
     if "IA" in model_type:
-        # Entrenamos solo con train_data, pero pasamos df_full para que el encoder sepa los nombres
         temp_model, temp_le = train_rf(train_data, df_full)
     else:
         temp_dc_stats, t_avg_h, t_avg_a = calculate_dc_stats(train_data)
 
-    # 3. Probar en datos desconocidos
     for _, r in test_data.iterrows():
         if "IA" in model_type:
-            # Usamos los datos de la fila (ya calculados)
-            ph, pd_p, pa = predict_rf(temp_model, temp_le, r['home'], r['away'], r['odd_h'], r['odd_d'], r['odd_a'],
-                                      r['h_form'], r['h_att'], r['h_def'], r['a_form'], r['a_att'], r['a_def'])
+            ph, pd_p, pa = predict_rf(temp_model, temp_le, r['home'], r['away'], r['odd_h'], r['odd_d'], r['odd_a'], r['h_form'], r['h_att'], r['h_def'], r['a_form'], r['a_att'], r['a_def'])
         else:
             ph, pd_p, pa, _, _ = predict_dc(r['home'], r['away'], temp_dc_stats, t_avg_h, t_avg_a)
             
-        # Decisión
         if ph > pd_p and ph > pa: pick, prob, odd, res_txt = "Local", ph, r['odd_h'], ("Local" if r['result']==1 else "Fallo")
         elif pa > ph and pa > pd_p: pick, prob, odd, res_txt = "Visita", pa, r['odd_a'], ("Visita" if r['result']==2 else "Fallo")
         else: pick, prob, odd, res_txt = "Empate", pd_p, r['odd_d'], ("Empate" if r['result']==0 else "Fallo")
         
-        is_win = (pick == res_txt)
-        profit = (odd - 1) if is_win else -1
-        bal += profit
-        if is_win: correct += 1
+        # --- FILTRO DE CONFIANZA ---
+        if prob >= min_conf:
+            is_win = (pick == res_txt)
+            profit = (odd - 1) if is_win else -1
+            bal += profit
+            if is_win: correct += 1
+            status_icon = "✅" if is_win else "❌"
+            pl_display = round(profit, 2)
+        else:
+            skipped += 1
+            status_icon = "⏭️"
+            pl_display = 0
+            pick = f"(Skip) {pick}"
+
+        log.append({"Partido": f"{r['home']} vs {r['away']}", "Pred": f"{pick} ({prob*100:.0f}%)", "Real": res_txt, "Cuota": odd, "Res": status_icon, "P/L": pl_display})
         
-        log.append({"Partido": f"{r['home']} vs {r['away']}", "Pred": f"{pick} ({prob*100:.0f}%)", "Real": res_txt, "Cuota": odd, "P/L": round(profit, 2)})
-        
-    return pd.DataFrame(log), correct, bal
+    return pd.DataFrame(log), correct, bal, skipped
 
 # ======================================================
 # 4. INTERFAZ GRÁFICA
@@ -235,73 +207,71 @@ with st.sidebar:
     
     raw = fetch_live_soccer_data(code)
     if raw.empty: st.error("Error datos"); st.stop()
-    
-    # Feature Engineering Global
     df_pro = calculate_rolling_features(raw)
     
     st.divider()
     m_type = st.radio("Cerebro:", ["Dixon-Coles (Estadístico)", "Random Forest (IA)"], index=1)
     
-    # Entrenamiento PRINCIPAL (Con TODOS los datos para predecir el futuro real)
+    # --- FILTRO FRANCOTIRADOR ---
+    st.divider()
+    st.markdown("### 🎯 Modo Francotirador")
+    confidence_threshold = st.slider("Confianza Mínima (%)", 0, 100, 50, step=5) / 100.0
+    st.caption(f"Solo se mostrarán apuestas donde la IA tenga >{confidence_threshold*100:.0f}% de seguridad.")
+
     if "IA" in m_type:
         rf_model_main, encoder_main = train_rf(df_pro, df_pro)
-        st.success(f"🚀 IA Maestra Entrenada ({len(df_pro)} partidos)")
+        st.success(f"🚀 IA Maestra Entrenada")
     else:
         dc_s_main, avg_h_main, avg_a_main = calculate_dc_stats(df_pro)
-        st.success("📐 Dixon-Coles Maestro Listo")
+        st.success("📐 Dixon-Coles Listo")
     
     st.divider()
     bank = st.number_input("💰 Tu Banco ($)", 1000.0, step=50.0)
 
 st.title(f"⚽ {leagues[code]} - {m_type}")
 
-# Inputs
 teams = sorted(raw['home'].unique())
 c1, c2 = st.columns(2)
 h_tm = c1.selectbox("Local", teams, index=0)
 a_tm = c2.selectbox("Visitante", [t for t in teams if t != h_tm], index=0)
 
-st.info("ℹ️ Ingresa cuotas reales para activar la predicción")
+st.info("ℹ️ Ingresa cuotas reales:")
 co1, co2, co3 = st.columns(3)
 oh = co1.number_input("Cuota 1", 1.01, 20.0, 2.0)
 od = co2.number_input("Cuota X", 1.01, 20.0, 3.2)
 oa = co3.number_input("Cuota 2", 1.01, 20.0, 3.5)
 
-# --- PREDICCIÓN FUTURA (Usamos el modelo maestro) ---
+# --- PREDICCIÓN ---
 he, ae = 0, 0
 if "IA" in m_type:
-    # Obtenemos stats recientes para pasar al modelo
-    h_row = df_pro[df_pro['home']==h_tm].tail(1)
-    a_row = df_pro[df_pro['away']==a_tm].tail(1)
-    
-    # Si es primera jornada, defaults a 0
+    h_row, a_row = df_pro[df_pro['home']==h_tm].tail(1), df_pro[df_pro['away']==a_tm].tail(1)
     hf, ha, hd = (h_row.iloc[0]['h_form'], h_row.iloc[0]['h_att'], h_row.iloc[0]['h_def']) if not h_row.empty else (0,0,0)
     af, aa, ad = (a_row.iloc[0]['a_form'], a_row.iloc[0]['a_att'], a_row.iloc[0]['a_def']) if not a_row.empty else (0,0,0)
-    
     ph, pd_p, pa = predict_rf(rf_model_main, encoder_main, h_tm, a_tm, oh, od, oa, hf, ha, hd, af, aa, ad)
-    msg = "IA Maestra (Toda la temporada)"
 else:
     ph, pd_p, pa, he, ae = predict_dc(h_tm, a_tm, dc_s_main, avg_h_main, avg_a_main)
-    msg = "Modelo Matemático Maestro"
+
+# --- LOGICA DE FILTRO VISUAL ---
+max_prob = max(ph, pd_p, pa)
+if max_prob >= confidence_threshold:
+    status_msg = "🔥 OPORTUNIDAD DETECTADA"
+    status_color = "success"
+else:
+    status_msg = f"💤 Partido Incierto (Max Confianza: {max_prob*100:.0f}%)"
+    status_color = "warning"
 
 # --- TABS ---
-tab1, tab2, tab3, tab4 = st.tabs(["📊 Análisis", "💰 Valor & Apuesta", "📜 Historial", "🧪 Laboratorio"])
+tab1, tab2, tab3, tab4 = st.tabs(["📊 Análisis", "💰 Valor", "📜 Historial", "🧪 Laboratorio"])
 
 with tab1:
-    st.markdown("### 🏆 Probabilidades")
+    if status_color == "success": st.success(status_msg)
+    else: st.warning(status_msg)
+
     c1, c2, c3 = st.columns(3)
     c1.plotly_chart(plot_gauge(ph, f"Gana {h_tm}", "#4CAF50"), use_container_width=True)
     c2.plotly_chart(plot_gauge(pd_p, "Empate", "#FFC107"), use_container_width=True)
     c3.plotly_chart(plot_gauge(pa, f"Gana {a_tm}", "#2196F3"), use_container_width=True)
-    st.caption(f"🧠 {msg}")
     
-    if he > 0:
-        st.markdown("### 🥅 Goles Esperados")
-        m1, m2, m3 = st.columns(3)
-        m1.metric(h_tm, f"{he:.2f}")
-        m2.metric("Total", f"{he+ae:.2f}")
-        m3.metric(a_tm, f"{ae:.2f}")
-
     st.markdown("### 📉 Forma Reciente")
     cf1, cf2 = st.columns(2)
     with cf1: st.dataframe(get_last_5(raw, h_tm), use_container_width=True, hide_index=True)
@@ -309,34 +279,37 @@ with tab1:
 
 with tab2:
     st.markdown("### 🏦 Cazador de Valor")
-    ev_h, kh = (ph*oh)-1, calculate_kelly(ph, oh)
-    ev_d, kd = (pd_p*od)-1, calculate_kelly(pd_p, od)
-    ev_a, ka = (pa*oa)-1, calculate_kelly(pa, oa)
-    
-    def card(lab, ev, k, odd):
-        if ev > 0:
-            st.success(f"✅ **{lab}** (+{ev*100:.1f}%)")
-            st.markdown(f"**Apostar:** ${bank*(k/100):.2f} ({k:.1f}%)")
-        else: st.error(f"❌ **{lab}** (EV {ev*100:.1f}%)")
-    
-    cv1, cv2, cv3 = st.columns(3)
-    with cv1: card(f"{h_tm}", ev_h, kh, oh)
-    with cv2: card("Empate", ev_d, kd, od)
-    with cv3: card(f"{a_tm}", ev_a, ka, oa)
-    
-    st.divider()
-    st.subheader("📝 Registrar Apuesta")
-    with st.form("bet"):
-        pk = st.selectbox("Pick", [f"Gana {h_tm}", "Empate", f"Gana {a_tm}"])
-        stk = st.number_input("Stake $", 1.0, 5000.0, 50.0)
-        if "Gana "+h_tm in pk: fo, fp = oh, ph
-        elif "Empate" in pk: fo, fp = od, pd_p
-        else: fo, fp = oa, pa
+    if max_prob < confidence_threshold:
+        st.info("🚫 La IA recomienda NO APOSTAR en este partido debido a la baja confianza.")
+    else:
+        ev_h, kh = (ph*oh)-1, calculate_kelly(ph, oh)
+        ev_d, kd = (pd_p*od)-1, calculate_kelly(pd_p, od)
+        ev_a, ka = (pa*oa)-1, calculate_kelly(pa, oa)
         
-        if st.form_submit_button("💾 Guardar"):
-            manage_bets("save", {"ID": pd.Timestamp.now().strftime('%Y%m%d%H%M%S'), "Fecha": pd.Timestamp.now().strftime('%Y-%m-%d'), 
-                                 "Liga": code, "Partido": f"{h_tm}-{a_tm}", "Pick": pk, "Cuota": fo, "Stake": stk, "Prob": round(fp, 4), "Estado": "Pendiente", "Ganancia": 0.0})
-            st.success("Guardado!"); st.rerun()
+        def card(lab, ev, k, odd):
+            if ev > 0:
+                st.success(f"✅ **{lab}** (+{ev*100:.1f}%)")
+                st.markdown(f"**Apostar:** ${bank*(k/100):.2f} ({k:.1f}%)")
+            else: st.error(f"❌ **{lab}** (EV {ev*100:.1f}%)")
+        
+        cv1, cv2, cv3 = st.columns(3)
+        with cv1: card(f"{h_tm}", ev_h, kh, oh)
+        with cv2: card("Empate", ev_d, kd, od)
+        with cv3: card(f"{a_tm}", ev_a, ka, oa)
+        
+        st.divider()
+        st.subheader("📝 Registrar Apuesta")
+        with st.form("bet"):
+            pk = st.selectbox("Pick", [f"Gana {h_tm}", "Empate", f"Gana {a_tm}"])
+            stk = st.number_input("Stake $", 1.0, 5000.0, 50.0)
+            if "Gana "+h_tm in pk: fo, fp = oh, ph
+            elif "Empate" in pk: fo, fp = od, pd_p
+            else: fo, fp = oa, pa
+            
+            if st.form_submit_button("💾 Guardar"):
+                manage_bets("save", {"ID": pd.Timestamp.now().strftime('%Y%m%d%H%M%S'), "Fecha": pd.Timestamp.now().strftime('%Y-%m-%d'), 
+                                     "Liga": code, "Partido": f"{h_tm}-{a_tm}", "Pick": pk, "Cuota": fo, "Stake": stk, "Prob": round(fp, 4), "Estado": "Pendiente", "Ganancia": 0.0})
+                st.success("Guardado!"); st.rerun()
 
 with tab3:
     st.markdown("### 📜 Historial")
@@ -351,24 +324,21 @@ with tab3:
                 res = st.selectbox("Resultado", ["Ganada", "Perdida", "Push"])
                 if st.button("Actualizar"): manage_bets("update", id_bet=bid, status=res); st.rerun()
             else: st.info("No hay pendientes")
-    else: st.info("Historial vacío")
 
 with tab4:
-    st.markdown("### 🧪 Backtesting Realista (Blind Test)")
-    st.info("Esta prueba entrena al modelo con el pasado y lo prueba con los últimos 20 partidos (que nunca ha visto). ¡Sin trampas!")
+    st.markdown("### 🧪 Laboratorio de Backtesting (Blind Test)")
+    st.info(f"Probando estrategia con **Filtro de Confianza > {confidence_threshold*100:.0f}%**.")
     
-    if st.button("▶️ Ejecutar Simulación Ciega"):
-        with st.spinner("Entrenando modelo temporal sin mirar el futuro..."):
-            test_df, ok, profit = run_backtest_blind(df_pro, m_type)
+    if st.button("▶️ Ejecutar Simulación"):
+        test_df, ok, profit, skips = run_backtest_blind(df_pro, m_type, min_conf=confidence_threshold)
         
-        acc = (ok/20)*100
-        m1, m2, m3 = st.columns(3)
-        m1.metric("Aciertos Reales", f"{ok}/20 ({acc:.0f}%)")
-        m2.metric("Profit Real (Stake 1U)", f"{profit:.2f} U", delta="Ganancia" if profit>0 else "Pérdida")
+        total_bets = 20 - skips
+        acc = (ok/total_bets)*100 if total_bets > 0 else 0
         
-        if profit > 0: st.balloons(); status = "🔥 Muy Rentable"
-        elif profit > -2: status = "😐 Estable"
-        else: status = "❄️ No Rentable hoy"
-        m3.metric("Veredicto", status)
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Partidos Totales", "20")
+        m2.metric("Apostados", f"{total_bets}")
+        m3.metric("Aciertos", f"{ok} ({acc:.0f}%)")
+        m4.metric("Profit", f"{profit:.2f} U", delta="Ganancia" if profit>0 else "Pérdida")
         
         st.dataframe(test_df, use_container_width=True)
