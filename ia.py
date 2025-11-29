@@ -45,7 +45,7 @@ def fetch_live_soccer_data(league_code="SP1"):
         }
         df = df.rename(columns=mapping).dropna()
         df['date'] = pd.to_datetime(df['date'], dayfirst=True, errors='coerce')
-        df = df.sort_values('date') # Importante ordenar por fecha
+        df = df.sort_values('date') 
         
         # TARGET: 0=Draw, 1=Home, 2=Away
         conditions = [
@@ -58,11 +58,7 @@ def fetch_live_soccer_data(league_code="SP1"):
     except: return pd.DataFrame()
 
 def calculate_rolling_features(df):
-    """
-    Crea estadísticas de forma reciente (últimos 3 partidos) para cada equipo.
-    Esta es la parte difícil: convertir formato Local-Visitante a formato Equipo-Partido.
-    """
-    # 1. Creamos un DataFrame vertical (Un equipo por fila)
+    """Crea estadísticas de forma reciente (últimos 3 partidos)"""
     home_df = df[['date', 'home', 'home_goals', 'away_goals', 'result']].copy()
     home_df.columns = ['date', 'team', 'gf', 'ga', 'res_match']
     home_df['points'] = np.where(home_df['res_match']==1, 3, np.where(home_df['res_match']==0, 1, 0))
@@ -73,33 +69,27 @@ def calculate_rolling_features(df):
     away_df['points'] = np.where(away_df['res_match']==2, 3, np.where(away_df['res_match']==0, 1, 0))
     away_df['is_home'] = 0
 
-    # 2. Concatenamos y ordenamos
     team_stats = pd.concat([home_df, away_df]).sort_values(['team', 'date'])
 
-    # 3. Calculamos Rolling Averages (Últimos 3 partidos)
-    # .shift() es vital: No podemos usar el partido de HOY para predecir HOY.
+    # Rolling Averages (Últimos 3 partidos)
     window = 3
     team_stats['form_points'] = team_stats.groupby('team')['points'].transform(lambda x: x.rolling(window, min_periods=1).sum().shift(1))
     team_stats['form_gf'] = team_stats.groupby('team')['gf'].transform(lambda x: x.rolling(window, min_periods=1).mean().shift(1))
     team_stats['form_ga'] = team_stats.groupby('team')['ga'].transform(lambda x: x.rolling(window, min_periods=1).mean().shift(1))
-
-    # Rellenamos NaN (primeros partidos de liga) con 0
     team_stats = team_stats.fillna(0)
 
-    # 4. Volvemos a pegar estos datos en el DataFrame original (Join)
-    # Unimos datos del LOCAL
+    # Merge con el DF original
     df = df.merge(team_stats[['date', 'team', 'form_points', 'form_gf', 'form_ga']], 
                   left_on=['date', 'home'], right_on=['date', 'team'], how='left')
     df = df.rename(columns={'form_points': 'h_form', 'form_gf': 'h_att_recent', 'form_ga': 'h_def_recent'})
     df = df.drop(columns=['team'])
 
-    # Unimos datos del VISITANTE
     df = df.merge(team_stats[['date', 'team', 'form_points', 'form_gf', 'form_ga']], 
                   left_on=['date', 'away'], right_on=['date', 'team'], how='left')
     df = df.rename(columns={'form_points': 'a_form', 'form_gf': 'a_att_recent', 'form_ga': 'a_def_recent'})
     df = df.drop(columns=['team'])
 
-    return df, team_stats # Retornamos también team_stats para buscar info actual
+    return df, team_stats
 
 # ======================================================
 # 3. MODELO 1: DIXON-COLES
@@ -144,10 +134,9 @@ def predict_dixon_coles(home, away, stats, avg_h, avg_a):
     return ph, pd_prob, pa, h_exp, a_exp
 
 # ======================================================
-# 4. MODELO 2: RANDOM FOREST AVANZADO (FORMA RECIENTE) 🤖
+# 4. MODELO 2: RANDOM FOREST AVANZADO
 # ======================================================
 def train_ai_model(df):
-    """Entrena Random Forest con Historial + Forma Reciente"""
     le = LabelEncoder()
     all_teams = pd.concat([df['home'], df['away']]).unique()
     le.fit(all_teams)
@@ -155,8 +144,6 @@ def train_ai_model(df):
     df['home_code'] = le.transform(df['home'])
     df['away_code'] = le.transform(df['away'])
     
-    # FEATURES AVANZADAS:
-    # IDs + Cuotas + Forma Local (Puntos, Ataque, Defensa) + Forma Visita
     features = ['home_code', 'away_code', 'odd_h', 'odd_d', 'odd_a',
                 'h_form', 'h_att_recent', 'h_def_recent',
                 'a_form', 'a_att_recent', 'a_def_recent']
@@ -170,11 +157,8 @@ def train_ai_model(df):
     return model, le
 
 def get_latest_team_stats(team, team_stats_df):
-    """Busca los datos más recientes de un equipo para predecir el futuro"""
     team_data = team_stats_df[team_stats_df['team'] == team].tail(1)
-    if team_data.empty: return 0, 0, 0 # Sin datos
-    # Para el futuro, su 'Rolling' incluye el último partido jugado
-    # Simplemente recalculamos rápido el rolling de los últimos 3
+    if team_data.empty: return 0, 0, 0 
     last_3 = team_stats_df[team_stats_df['team'] == team].tail(3)
     form = last_3['points'].sum()
     att = last_3['gf'].mean()
@@ -186,7 +170,6 @@ def predict_ai_advanced(model, le, team_stats_df, home, away, odd_h, odd_d, odd_
         h_code = le.transform([home])[0]
         a_code = le.transform([away])[0]
         
-        # Obtener forma reciente REAL
         h_form, h_att, h_def = get_latest_team_stats(home, team_stats_df)
         a_form, a_att, a_def = get_latest_team_stats(away, team_stats_df)
         
@@ -221,7 +204,6 @@ with st.sidebar:
     raw_df = fetch_live_soccer_data(code)
     if raw_df.empty: st.error("Error datos"); st.stop()
     
-    # PROCESAMIENTO
     df_processed, team_stats_history = calculate_rolling_features(raw_df)
     
     st.divider()
@@ -229,7 +211,7 @@ with st.sidebar:
     
     if "IA" in model_type:
         ai_model, encoder = train_ai_model(df_processed)
-        st.success(f"🚀 IA Entrenada con {len(df_processed)} partidos + Forma Reciente")
+        st.success(f"🚀 IA Entrenada ({len(df_processed)} datos)")
     else:
         stats, ah, aa = calculate_strengths(raw_df)
         st.success("📐 Modelo Estadístico Listo")
@@ -243,11 +225,11 @@ away = c2.selectbox("Visitante", [t for t in teams if t != home], index=0)
 
 st.info("ℹ️ Ingresa cuotas reales para activar la predicción")
 co1, co2, co3 = st.columns(3)
-odd_h = co1.number_input("Cuota 1", 1.01, 20.0, 2.0)
-odd_d = co2.number_input("Cuota X", 1.01, 20.0, 3.2)
-odd_a = co3.number_input("Cuota 2", 1.01, 20.0, 3.5)
+odd_h = co1.number_input("Cuota Local", 1.01, 20.0, 2.0)
+odd_d = co2.number_input("Cuota Empate", 1.01, 20.0, 3.2)
+odd_a = co3.number_input("Cuota Visita", 1.01, 20.0, 3.5)
 
-# --- EJECUCIÓN ---
+# EJECUCIÓN
 h_points_recent, a_points_recent = 0, 0
 
 if "IA" in model_type:
@@ -259,7 +241,7 @@ else:
     ph, pd_prob, pa, h_exp, a_exp = predict_dixon_coles(home, away, stats, ah, aa)
     model_msg = "Modelo estadístico puro"
 
-# --- VISUALIZACIÓN ---
+# VISUALIZACIÓN
 st.divider()
 g1, g2, g3 = st.columns(3)
 
@@ -276,17 +258,19 @@ g3.plotly_chart(plot_gauge(pa, f"Gana {away}", "#2196F3"), use_container_width=T
 if "IA" in model_type:
     st.caption(f"📊 Datos usados por la IA: {home} ({h_points_recent}/9 ptos recientes) vs {away} ({a_points_recent}/9 ptos recientes)")
 
-# Valor Esperado
+# Valor Esperado (EV)
 ev_h = (ph * odd_h) - 1
 ev_d = (pd_prob * odd_d) - 1
 ev_a = (pa * odd_a) - 1
 
 st.markdown("### 🏦 Análisis de Valor")
 v1, v2, v3 = st.columns(3)
+
+# --- CORRECCIÓN FINAL: USAR WITH EN LUGAR DE v1.metodo ---
 def show_val(label, ev):
     if ev > 0: st.success(f"{label}: +{ev*100:.1f}% EV ✅")
     else: st.error(f"{label}: {ev*100:.1f}% EV ❌")
 
-v1.show_val(f"Apostar {home}", ev_h)
-v2.show_val("Apostar Empate", ev_d)
-v3.show_val(f"Apostar {away}", ev_a)
+with v1: show_val(f"Apostar {home}", ev_h)
+with v2: show_val("Apostar Empate", ev_d)
+with v3: show_val(f"Apostar {away}", ev_a)
