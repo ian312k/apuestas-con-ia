@@ -3,5 +3,5 @@ pandas
 numpy
 scipy
 plotly
-watchdog
+xgboost
 scikit-learn
