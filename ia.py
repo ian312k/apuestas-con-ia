@@ -8,7 +8,7 @@ import os
 # ======================================================
 # 1. CONFIGURACIÓN Y ESTILOS CSS (DARK MODE) 🎨
 # ======================================================
-st.set_page_config(page_title="Dixon-Coles Híbrido", layout="wide", page_icon="⚽")
+st.set_page_config(page_title="Dixon-Coles Pro + Parlay", layout="wide", page_icon="⚽")
 CSV_FILE = 'mis_apuestas_pro.csv'
 
 # Inicializar Session State para el Parlay
@@ -40,7 +40,7 @@ st.markdown("""
 # 2. LÓGICA DE DATOS Y MODELO MATEMÁTICO 🧠
 # ======================================================
 
-# Cache con TTL de 1 hora para auto-actualización
+# Cache con TTL de 1 hora
 @st.cache_data(ttl=3600)
 def fetch_live_soccer_data(league_code="SP1"):
     """Descarga datos incluyendo cuotas históricas"""
@@ -65,15 +65,14 @@ def fetch_live_soccer_data(league_code="SP1"):
     except: return pd.DataFrame()
 
 def calculate_strengths(df):
-    """Calcula fuerza HÍBRIDA: Mezcla forma Local/Visita (70%) con forma General (30%)"""
+    """Calcula fuerza HÍBRIDA: Mezcla forma Local/Visita (40%) con forma General (60%)"""
+    # NOTA: Mantengo la configuración "suave" que discutimos para no castigar tanto al City
     last_date = df['date'].max()
     df['days_ago'] = (last_date - df['date']).dt.days
     
-    # AJUSTE: Alpha más suave (0.003) para tener más memoria
-    alpha = 0.003 
+    alpha = 0.001 # Memoria larga
     df['weight'] = np.exp(-alpha * df['days_ago'])
     
-    # Promedios de la liga
     avg_home = np.average(df['home_goals'], weights=df['weight'])
     avg_away = np.average(df['away_goals'], weights=df['weight'])
     avg_global = (avg_home + avg_away) / 2
@@ -81,11 +80,10 @@ def calculate_strengths(df):
     team_stats = {}
     all_teams = sorted(list(set(df['home'].unique()) | set(df['away'].unique())))
     
-    # FACTOR DE MEZCLA (0.7 = 70% Específico + 30% General)
-    MIX_FACTOR = 0.7 
+    MIX_FACTOR = 0.4 # Pesa más la calidad general
     
     for team in all_teams:
-        # 1. Calcular Stats Generales (Globales)
+        # 1. Stats Generales
         team_matches = df[(df['home'] == team) | (df['away'] == team)].copy()
         if not team_matches.empty:
             team_matches['goals_scored'] = np.where(team_matches['home'] == team, team_matches['home_goals'], team_matches['away_goals'])
@@ -96,21 +94,20 @@ def calculate_strengths(df):
         else:
             att_global, def_global = 1.0, 1.0
 
-        # 2. Calcular Stats Específicas (Home)
+        # 2. Stats Home
         h_m = df[df['home'] == team]
         if not h_m.empty:
             att_h_pure = np.average(h_m['home_goals'], weights=h_m['weight']) / avg_home
             def_h_pure = np.average(h_m['away_goals'], weights=h_m['weight']) / avg_away
         else: att_h_pure, def_h_pure = 1.0, 1.0
 
-        # 3. Calcular Stats Específicas (Away)
+        # 3. Stats Away
         a_m = df[df['away'] == team]
         if not a_m.empty:
             att_a_pure = np.average(a_m['away_goals'], weights=a_m['weight']) / avg_away
             def_a_pure = np.average(a_m['home_goals'], weights=a_m['weight']) / avg_home
         else: att_a_pure, def_a_pure = 1.0, 1.0
             
-        # 4. MEZCLAR Y GUARDAR
         team_stats[team] = {
             'att_h': (att_h_pure * MIX_FACTOR) + (att_global * (1 - MIX_FACTOR)),
             'def_h': (def_h_pure * MIX_FACTOR) + (def_global * (1 - MIX_FACTOR)),
@@ -145,10 +142,19 @@ def predict_match_dixon_coles(home, away, team_stats, avg_h, avg_a):
     p_draw = np.diag(probs).sum()
     p_away = np.triu(probs, 1).sum()
     
+    # --- CÁLCULO DE MERCADOS DE GOLES ---
+    p_o15 = 0
     p_o25 = 0
+    p_btts = 0
+    
     for i in range(max_goals):
         for j in range(max_goals):
+            # Over 1.5
+            if (i+j) > 1.5: p_o15 += probs[i][j]
+            # Over 2.5
             if (i+j) > 2.5: p_o25 += probs[i][j]
+            # BTTS (Ambos > 0)
+            if i > 0 and j > 0: p_btts += probs[i][j]
 
     flat_indices = np.argsort(probs.ravel())[::-1][:3]
     top_scores = []
@@ -156,7 +162,7 @@ def predict_match_dixon_coles(home, away, team_stats, avg_h, avg_a):
         i, j = np.unravel_index(idx, probs.shape)
         top_scores.append((f"{i}-{j}", probs[i][j]))
 
-    return h_exp, a_exp, p_home, p_draw, p_away, p_o25, top_scores
+    return h_exp, a_exp, p_home, p_draw, p_away, p_o15, p_o25, p_btts, top_scores
 
 def run_backtest(df, team_stats, avg_h, avg_a):
     """Prueba el modelo con los últimos 50 partidos"""
@@ -165,7 +171,8 @@ def run_backtest(df, team_stats, avg_h, avg_a):
     correct, bal = 0, 0
     
     for _, row in recent.iterrows():
-        _, _, ph, pd_prob, pa, _, _ = predict_match_dixon_coles(row['home'], row['away'], team_stats, avg_h, avg_a)
+        # Desempaquetamos los nuevos valores (aunque no los usemos todos en el backtest simple)
+        _, _, ph, pd_prob, pa, _, _, _, _ = predict_match_dixon_coles(row['home'], row['away'], team_stats, avg_h, avg_a)
         
         if ph > pd_prob and ph > pa: pred, prob, odd, res_real = "Local", ph, row['odd_h'], ("Local" if row['home_goals'] > row['away_goals'] else "Fallo")
         elif pa > ph and pa > pd_prob: pred, prob, odd, res_real = "Visita", pa, row['odd_a'], ("Visita" if row['away_goals'] > row['home_goals'] else "Fallo")
@@ -232,11 +239,9 @@ def manage_bets(mode, data=None, id_bet=None, status=None):
 with st.sidebar:
     st.header("⚙️ Configuración")
     
-    # --- BOTÓN PARA FORZAR ACTUALIZACIÓN ---
     if st.button("🔄 Actualizar Datos"):
         st.cache_data.clear()
         st.rerun()
-    # ---------------------------------------
 
     leagues = {
         "SP1": "🇪🇸 La Liga", 
@@ -254,7 +259,6 @@ with st.sidebar:
         stats, ah, aa, teams = calculate_strengths(df)
         st.success(f"✅ {len(df)} partidos cargados")
         
-        # --- ÚLTIMOS RESULTADOS ---
         st.markdown("---")
         st.markdown("###### 🕒 Últimos 5 Registrados:")
         last_5 = df.tail(5).copy().iloc[::-1]
@@ -262,7 +266,6 @@ with st.sidebar:
         last_5['Partido'] = last_5['home'] + " vs " + last_5['away']
         last_5['Score'] = last_5['home_goals'].astype(int).astype(str) + "-" + last_5['away_goals'].astype(int).astype(str)
         st.dataframe(last_5[['Fecha', 'Partido', 'Score']], hide_index=True, use_container_width=True)
-        # --------------------------
         
     else: st.error("Error cargando datos"); st.stop()
     
@@ -283,8 +286,8 @@ c1, c2 = st.columns(2)
 home = c1.selectbox("Local", teams)
 away = c2.selectbox("Visitante", [t for t in teams if t != home])
 
-# EJECUCIÓN DEL MODELO
-h_exp, a_exp, ph, pd_prob, pa, po25, top_sc = predict_match_dixon_coles(home, away, stats, ah, aa)
+# EJECUCIÓN DEL MODELO (Ahora devuelve 2 variables extra: po15 y pbtts)
+h_exp, a_exp, ph, pd_prob, pa, po15, po25, pbtts, top_sc = predict_match_dixon_coles(home, away, stats, ah, aa)
 
 # PESTAÑAS
 t1, t2, t3, t4 = st.tabs(["📊 Análisis", "💰 Valor y Parlay", "📜 Historial", "🧪 Laboratorio"])
@@ -293,10 +296,17 @@ with t1:
     st.markdown("### 🥅 Expectativa de Goles")
     c_g1, c_g2, c_g3 = st.columns(3)
     c_g1.metric(home, f"{h_exp:.2f}")
-    c_g2.metric("Total", f"{h_exp+a_exp:.2f}", delta="Over 2.5: "+f"{po25*100:.0f}%")
+    c_g2.metric("Total (xG)", f"{h_exp+a_exp:.2f}", delta="Over 2.5: "+f"{po25*100:.0f}%")
     c_g3.metric(away, f"{a_exp:.2f}")
+
+    # --- NUEVA SECCIÓN: MERCADOS DE GOLES ---
+    st.markdown("### 📊 Probabilidades de Gol")
+    mg1, mg2 = st.columns(2)
+    mg1.metric("Over 1.5 Goles", f"{po15*100:.1f}%", help="Probabilidad de que haya 2 o más goles en total")
+    mg2.metric("Ambos Anotan (BTTS)", f"{pbtts*100:.1f}%", help="Probabilidad de que ambos equipos marquen al menos un gol")
+    # ----------------------------------------
     
-    st.markdown("### 🏆 Probabilidades")
+    st.markdown("### 🏆 Probabilidades 1X2")
     g1, g2, g3 = st.columns(3)
     g1.plotly_chart(plot_gauge(ph, f"Gana {home}", "#4CAF50"), use_container_width=True)
     g2.plotly_chart(plot_gauge(pd_prob, "Empate", "#FFC107"), use_container_width=True)
@@ -324,7 +334,6 @@ with t2:
         ev_d, kd = (pd_prob*od)-1, calculate_kelly(pd_prob, od)
         ev_a, ka = (pa*oa)-1, calculate_kelly(pa, oa)
 
-        # Mostrar tarjetas
         def card(lab, ev, k, odd):
             color = "green" if ev > 0 else "red"
             st.markdown(f"""
@@ -394,7 +403,6 @@ with t2:
 
             st.divider()
             
-            # Cálculos finales del Parlay
             st.metric("Cuota Combinada", f"{total_odd:.2f}")
             st.metric("Probabilidad Total", f"{total_prob*100:.1f}%")
             
