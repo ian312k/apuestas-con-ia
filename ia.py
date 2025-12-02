@@ -8,7 +8,7 @@ import os
 # ======================================================
 # 1. CONFIGURACIÓN Y ESTILOS CSS (DARK MODE) 🎨
 # ======================================================
-st.set_page_config(page_title="Dixon-Coles Pro + Parlay", layout="wide", page_icon="⚽")
+st.set_page_config(page_title="Dixon-Coles Híbrido", layout="wide", page_icon="⚽")
 CSV_FILE = 'mis_apuestas_pro.csv'
 
 # Inicializar Session State para el Parlay
@@ -39,7 +39,9 @@ st.markdown("""
 # ======================================================
 # 2. LÓGICA DE DATOS Y MODELO MATEMÁTICO 🧠
 # ======================================================
-@st.cache_data
+
+# Cache con TTL de 1 hora para auto-actualización
+@st.cache_data(ttl=3600)
 def fetch_live_soccer_data(league_code="SP1"):
     """Descarga datos incluyendo cuotas históricas"""
     url = f"https://www.football-data.co.uk/mmz4281/2526/{league_code}.csv"
@@ -63,32 +65,58 @@ def fetch_live_soccer_data(league_code="SP1"):
     except: return pd.DataFrame()
 
 def calculate_strengths(df):
-    """Calcula fuerza de ataque/defensa con Time Decay"""
+    """Calcula fuerza HÍBRIDA: Mezcla forma Local/Visita (70%) con forma General (30%)"""
     last_date = df['date'].max()
     df['days_ago'] = (last_date - df['date']).dt.days
-    alpha = 0.005 
+    
+    # AJUSTE: Alpha más suave (0.003) para tener más memoria
+    alpha = 0.003 
     df['weight'] = np.exp(-alpha * df['days_ago'])
     
+    # Promedios de la liga
     avg_home = np.average(df['home_goals'], weights=df['weight'])
     avg_away = np.average(df['away_goals'], weights=df['weight'])
+    avg_global = (avg_home + avg_away) / 2
     
     team_stats = {}
     all_teams = sorted(list(set(df['home'].unique()) | set(df['away'].unique())))
     
+    # FACTOR DE MEZCLA (0.7 = 70% Específico + 30% General)
+    MIX_FACTOR = 0.7 
+    
     for team in all_teams:
+        # 1. Calcular Stats Generales (Globales)
+        team_matches = df[(df['home'] == team) | (df['away'] == team)].copy()
+        if not team_matches.empty:
+            team_matches['goals_scored'] = np.where(team_matches['home'] == team, team_matches['home_goals'], team_matches['away_goals'])
+            team_matches['goals_conceded'] = np.where(team_matches['home'] == team, team_matches['away_goals'], team_matches['home_goals'])
+            
+            att_global = np.average(team_matches['goals_scored'], weights=team_matches['weight']) / avg_global
+            def_global = np.average(team_matches['goals_conceded'], weights=team_matches['weight']) / avg_global
+        else:
+            att_global, def_global = 1.0, 1.0
+
+        # 2. Calcular Stats Específicas (Home)
         h_m = df[df['home'] == team]
         if not h_m.empty:
-            att_h = np.average(h_m['home_goals'], weights=h_m['weight']) / avg_home
-            def_h = np.average(h_m['away_goals'], weights=h_m['weight']) / avg_away
-        else: att_h, def_h = 1.0, 1.0
+            att_h_pure = np.average(h_m['home_goals'], weights=h_m['weight']) / avg_home
+            def_h_pure = np.average(h_m['away_goals'], weights=h_m['weight']) / avg_away
+        else: att_h_pure, def_h_pure = 1.0, 1.0
 
+        # 3. Calcular Stats Específicas (Away)
         a_m = df[df['away'] == team]
         if not a_m.empty:
-            att_a = np.average(a_m['away_goals'], weights=a_m['weight']) / avg_away
-            def_a = np.average(a_m['home_goals'], weights=a_m['weight']) / avg_home
-        else: att_a, def_a = 1.0, 1.0
+            att_a_pure = np.average(a_m['away_goals'], weights=a_m['weight']) / avg_away
+            def_a_pure = np.average(a_m['home_goals'], weights=a_m['weight']) / avg_home
+        else: att_a_pure, def_a_pure = 1.0, 1.0
             
-        team_stats[team] = {'att_h': att_h, 'def_h': def_h, 'att_a': att_a, 'def_a': def_a}
+        # 4. MEZCLAR Y GUARDAR
+        team_stats[team] = {
+            'att_h': (att_h_pure * MIX_FACTOR) + (att_global * (1 - MIX_FACTOR)),
+            'def_h': (def_h_pure * MIX_FACTOR) + (def_global * (1 - MIX_FACTOR)),
+            'att_a': (att_a_pure * MIX_FACTOR) + (att_global * (1 - MIX_FACTOR)),
+            'def_a': (def_a_pure * MIX_FACTOR) + (def_global * (1 - MIX_FACTOR))
+        }
         
     return team_stats, avg_home, avg_away, all_teams
 
@@ -203,6 +231,13 @@ def manage_bets(mode, data=None, id_bet=None, status=None):
 # ======================================================
 with st.sidebar:
     st.header("⚙️ Configuración")
+    
+    # --- BOTÓN PARA FORZAR ACTUALIZACIÓN ---
+    if st.button("🔄 Actualizar Datos"):
+        st.cache_data.clear()
+        st.rerun()
+    # ---------------------------------------
+
     leagues = {
         "SP1": "🇪🇸 La Liga", 
         "E0": "🏴󠁧󠁢󠁥󠁮󠁧󠁿 Premier League", 
@@ -219,24 +254,21 @@ with st.sidebar:
         stats, ah, aa, teams = calculate_strengths(df)
         st.success(f"✅ {len(df)} partidos cargados")
         
-        # --- NUEVA SECCIÓN: ÚLTIMOS RESULTADOS ACTUALIZADOS ---
+        # --- ÚLTIMOS RESULTADOS ---
         st.markdown("---")
         st.markdown("###### 🕒 Últimos 5 Registrados:")
-        # Tomamos los últimos 5 y los invertimos para ver el más reciente arriba
         last_5 = df.tail(5).copy().iloc[::-1]
         last_5['Fecha'] = last_5['date'].dt.strftime('%d/%m')
         last_5['Partido'] = last_5['home'] + " vs " + last_5['away']
         last_5['Score'] = last_5['home_goals'].astype(int).astype(str) + "-" + last_5['away_goals'].astype(int).astype(str)
-        # Mostramos una tabla limpia
         st.dataframe(last_5[['Fecha', 'Partido', 'Score']], hide_index=True, use_container_width=True)
-        # ------------------------------------------------------
+        # --------------------------
         
     else: st.error("Error cargando datos"); st.stop()
     
     st.divider()
     bank = st.number_input("💰 Tu Banco ($)", 1000.0, step=50.0)
     
-    # TICKET EN SIDEBAR
     if st.session_state.ticket:
         st.divider()
         st.markdown("### 🎫 Ticket Actual")
