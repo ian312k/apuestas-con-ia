@@ -1,4 +1,9 @@
-
+import streamlit as st
+import pandas as pd
+import numpy as np
+from scipy.stats import poisson
+import plotly.graph_objects as go
+import os
 
 # ======================================================
 # 1. CONFIGURACIÓN Y ESTILOS CSS (DARK MODE) 🎨
@@ -449,4 +454,3 @@ with t4:
         m2.metric("Profit (Stake 1U)", f"{profit:.2f} U", delta_color="normal")
         m3.metric("Estado", "🔥 Rentable" if profit > 0 else "❄️ Pérdidas")
         st.dataframe(test_df, use_container_width=True)
-
