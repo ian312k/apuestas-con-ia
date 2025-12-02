@@ -69,7 +69,7 @@ def calculate_strengths(df):
     last_date = df['date'].max()
     df['days_ago'] = (last_date - df['date']).dt.days
     
-    alpha = 0.003  # Memoria equilibrada
+    alpha = 0.004  # Memoria equilibrada
     df['weight'] = np.exp(-alpha * df['days_ago'])
     
     avg_home = np.average(df['home_goals'], weights=df['weight'])
@@ -461,3 +461,4 @@ with t4:
         m2.metric("Profit (Stake 1U)", f"{profit:.2f} U", delta_color="normal")
         m3.metric("Estado", "🔥 Rentable" if profit > 0 else "❄️ Pérdidas")
         st.dataframe(test_df, use_container_width=True)
+
