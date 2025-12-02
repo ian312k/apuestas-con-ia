@@ -65,12 +65,12 @@ def fetch_live_soccer_data(league_code="SP1"):
     except: return pd.DataFrame()
 
 def calculate_strengths(df):
-    """Calcula fuerza HÍBRIDA: Mezcla forma Local/Visita (40%) con forma General (60%)"""
-    # NOTA: Mantengo la configuración "suave" que discutimos para no castigar tanto al City
+    """Calcula fuerza HÍBRIDA: Mezcla forma Local/Visita (70%) con forma General (30%)"""
     last_date = df['date'].max()
     df['days_ago'] = (last_date - df['date']).dt.days
     
-    alpha = 0.001 # Memoria larga
+    # === REGRESAMOS A LA CONFIGURACIÓN ANTERIOR ===
+    alpha = 0.003  # Memoria equilibrada (antes 0.001)
     df['weight'] = np.exp(-alpha * df['days_ago'])
     
     avg_home = np.average(df['home_goals'], weights=df['weight'])
@@ -80,7 +80,8 @@ def calculate_strengths(df):
     team_stats = {}
     all_teams = sorted(list(set(df['home'].unique()) | set(df['away'].unique())))
     
-    MIX_FACTOR = 0.4 # Pesa más la calidad general
+    # === REGRESAMOS A LA CONFIGURACIÓN ANTERIOR ===
+    MIX_FACTOR = 0.7  # Pesa más la localía/visita (70%) que la jerarquía (30%)
     
     for team in all_teams:
         # 1. Stats Generales
@@ -142,7 +143,7 @@ def predict_match_dixon_coles(home, away, team_stats, avg_h, avg_a):
     p_draw = np.diag(probs).sum()
     p_away = np.triu(probs, 1).sum()
     
-    # --- CÁLCULO DE MERCADOS DE GOLES ---
+    # --- CÁLCULO DE MERCADOS DE GOLES (NUEVO) ---
     p_o15 = 0
     p_o25 = 0
     p_btts = 0
@@ -171,7 +172,7 @@ def run_backtest(df, team_stats, avg_h, avg_a):
     correct, bal = 0, 0
     
     for _, row in recent.iterrows():
-        # Desempaquetamos los nuevos valores (aunque no los usemos todos en el backtest simple)
+        # Desempaquetamos los nuevos valores
         _, _, ph, pd_prob, pa, _, _, _, _ = predict_match_dixon_coles(row['home'], row['away'], team_stats, avg_h, avg_a)
         
         if ph > pd_prob and ph > pa: pred, prob, odd, res_real = "Local", ph, row['odd_h'], ("Local" if row['home_goals'] > row['away_goals'] else "Fallo")
@@ -286,7 +287,7 @@ c1, c2 = st.columns(2)
 home = c1.selectbox("Local", teams)
 away = c2.selectbox("Visitante", [t for t in teams if t != home])
 
-# EJECUCIÓN DEL MODELO (Ahora devuelve 2 variables extra: po15 y pbtts)
+# EJECUCIÓN DEL MODELO (Incluye po15, pbtts)
 h_exp, a_exp, ph, pd_prob, pa, po15, po25, pbtts, top_sc = predict_match_dixon_coles(home, away, stats, ah, aa)
 
 # PESTAÑAS
@@ -299,7 +300,7 @@ with t1:
     c_g2.metric("Total (xG)", f"{h_exp+a_exp:.2f}", delta="Over 2.5: "+f"{po25*100:.0f}%")
     c_g3.metric(away, f"{a_exp:.2f}")
 
-    # --- NUEVA SECCIÓN: MERCADOS DE GOLES ---
+    # --- SECCIÓN: MERCADOS DE GOLES ---
     st.markdown("### 📊 Probabilidades de Gol")
     mg1, mg2 = st.columns(2)
     mg1.metric("Over 1.5 Goles", f"{po15*100:.1f}%", help="Probabilidad de que haya 2 o más goles en total")
